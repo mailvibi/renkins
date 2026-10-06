@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "cargo init": true,
+        "cargo test": true,
+        "cargo fmt": true,
+        "cargo clippy": true,
+        "cargo run": true
+    }
+}
