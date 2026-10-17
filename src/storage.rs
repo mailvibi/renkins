@@ -2,6 +2,10 @@ use crate::domain::{Build, Job};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const SCHEMA_VERSION: i32 = 1;
+const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 
 #[derive(Debug)]
 pub struct DatabaseStore {
@@ -23,6 +27,8 @@ impl DatabaseStore {
             "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
         )
         .map_err(|err| format!("failed to configure sqlite database: {err}"))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|err| format!("failed to configure sqlite busy timeout: {err}"))?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -30,45 +36,35 @@ impl DatabaseStore {
         })
     }
 
-    pub fn initialize_schema(&self) -> Result<(), String> {
-        self.conn
-            .execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    repository_url TEXT NOT NULL,
-                    default_ref TEXT,
-                    disabled INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                );
+    pub fn initialize_schema(&mut self) -> Result<(), String> {
+        let current_version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|err| format!("failed to read sqlite schema version: {err}"))?;
 
-                CREATE TABLE IF NOT EXISTS builds (
-                    id TEXT PRIMARY KEY,
-                    job_id TEXT NOT NULL,
-                    number INTEGER NOT NULL,
-                    requested_ref TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    FOREIGN KEY(job_id) REFERENCES jobs(id),
-                    UNIQUE(job_id, number)
-                );
+        if current_version > SCHEMA_VERSION {
+            return Err(format!(
+                "database schema version {current_version} is newer than supported version {SCHEMA_VERSION}"
+            ));
+        }
 
-                CREATE TABLE IF NOT EXISTS build_steps (
-                    build_id TEXT NOT NULL,
-                    step_index INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    command TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    PRIMARY KEY(build_id, step_index),
-                    FOREIGN KEY(build_id) REFERENCES builds(id)
-                );
-                "#,
-            )
-            .map_err(|err| format!("failed to initialize schema: {err}"))?;
+        if current_version == SCHEMA_VERSION {
+            return Ok(());
+        }
 
-        Ok(())
+        let transaction = self
+            .conn
+            .transaction()
+            .map_err(|err| format!("failed to begin schema migration: {err}"))?;
+        transaction
+            .execute_batch(INITIAL_SCHEMA)
+            .map_err(|err| format!("failed to apply sqlite schema migration 1: {err}"))?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|err| format!("failed to record sqlite schema version: {err}"))?;
+        transaction
+            .commit()
+            .map_err(|err| format!("failed to commit sqlite schema migration: {err}"))
     }
 
     pub fn create_job(&self, job: &Job) -> Result<(), String> {
@@ -125,7 +121,7 @@ mod tests {
     fn creates_a_sqlite_database_and_schema() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("renkins.sqlite3");
-        let store = DatabaseStore::open(&db_path).expect("database should open");
+        let mut store = DatabaseStore::open(&db_path).expect("database should open");
         store.initialize_schema().expect("schema should initialize");
         assert!(db_path.exists());
     }
@@ -134,7 +130,7 @@ mod tests {
     fn persists_job_and_build_records() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("renkins.sqlite3");
-        let store = DatabaseStore::open(&db_path).unwrap();
+        let mut store = DatabaseStore::open(&db_path).unwrap();
         store.initialize_schema().unwrap();
 
         let job = Job {
@@ -156,5 +152,58 @@ mod tests {
         store.create_build(&build).unwrap();
 
         assert_eq!(store.count_jobs().unwrap(), 1);
+    }
+
+    #[test]
+    fn migration_is_versioned_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("renkins.sqlite3");
+        let mut store = DatabaseStore::open(&db_path).unwrap();
+
+        store.initialize_schema().unwrap();
+        store.initialize_schema().unwrap();
+
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rejects_database_schema_from_a_newer_version() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("renkins.sqlite3");
+        let mut store = DatabaseStore::open(&db_path).unwrap();
+        store
+            .conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+
+        let error = store.initialize_schema().unwrap_err();
+        assert!(error.contains("newer than supported version"));
+    }
+
+    #[test]
+    fn configures_sqlite_connection_pragmas_and_busy_timeout() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("renkins.sqlite3");
+        let store = DatabaseStore::open(&db_path).unwrap();
+
+        let foreign_keys: i32 = store
+            .conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        let journal_mode: String = store
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i32 = store
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout, 5_000);
     }
 }
