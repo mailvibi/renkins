@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{io, os::unix::process::CommandExt};
+
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepStatus {
@@ -88,7 +91,8 @@ pub fn run_step(
         .arg("-c")
         .arg(&step.run)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
 
     let mut child = command
         .spawn()
@@ -101,14 +105,15 @@ pub fn run_step(
     let stderr_log = log_path.to_path_buf();
     let stdout_thread = read_stream(stdout, stdout_log, "stdout".to_string());
     let stderr_thread = read_stream(stderr, stderr_log, "stderr".to_string());
+    let process_group = child.id();
 
     let timeout = timeout_seconds.map(Duration::from_secs);
     let deadline = timeout.map(|d| Instant::now() + d);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
+                terminate_process_group(process_group)?;
+                join_streams(stdout_thread, stderr_thread)?;
                 let code = status.code().unwrap_or(-1);
                 return Ok(StepOutcome {
                     name: step.name.clone(),
@@ -124,10 +129,11 @@ pub fn run_step(
             }
             Ok(None) => {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
+                    terminate_process_group(process_group)?;
+                    child
+                        .wait()
+                        .map_err(|err| ExecutorError::SpawnFailed(err.to_string()))?;
+                    join_streams(stdout_thread, stderr_thread)?;
                     return Ok(StepOutcome {
                         name: step.name.clone(),
                         command: step.run.clone(),
@@ -139,10 +145,55 @@ pub fn run_step(
                 thread::sleep(Duration::from_millis(20));
             }
             Err(err) => {
+                terminate_process_group(process_group)?;
+                child
+                    .wait()
+                    .map_err(|wait_err| ExecutorError::SpawnFailed(wait_err.to_string()))?;
+                join_streams(stdout_thread, stderr_thread)?;
                 return Err(ExecutorError::SpawnFailed(err.to_string()));
             }
         }
     }
+}
+
+fn terminate_process_group(process_group: u32) -> Result<(), ExecutorError> {
+    if !signal_process_group(process_group, libc::SIGTERM)? {
+        return Ok(());
+    }
+    thread::sleep(PROCESS_TERMINATION_GRACE);
+    signal_process_group(process_group, libc::SIGKILL)?;
+    Ok(())
+}
+
+fn signal_process_group(process_group: u32, signal: i32) -> Result<bool, ExecutorError> {
+    let process_group = libc::pid_t::try_from(process_group)
+        .map_err(|err| ExecutorError::SpawnFailed(err.to_string()))?;
+    let result = unsafe { libc::kill(-process_group, signal) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(ExecutorError::SpawnFailed(format!(
+            "failed to signal process group {process_group}: {error}"
+        )))
+    }
+}
+
+fn join_streams(
+    stdout_thread: thread::JoinHandle<Result<(), ExecutorError>>,
+    stderr_thread: thread::JoinHandle<Result<(), ExecutorError>>,
+) -> Result<(), ExecutorError> {
+    let stdout_result = stdout_thread
+        .join()
+        .map_err(|_| ExecutorError::LogWriteFailed("stdout reader thread panicked".to_string()))?;
+    let stderr_result = stderr_thread
+        .join()
+        .map_err(|_| ExecutorError::LogWriteFailed("stderr reader thread panicked".to_string()))?;
+    stdout_result?;
+    stderr_result
 }
 
 pub fn execute_pipeline(
@@ -220,5 +271,55 @@ mod tests {
         let outcome = run_step(&step, workspace, &log_path, Some(1)).unwrap();
         assert!(matches!(outcome.status, StepStatus::TimedOut));
         assert_eq!(outcome.exit_code, None);
+    }
+
+    #[test]
+    fn terminates_same_group_descendants_that_inherit_output_pipes() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let log_path = workspace.join("descendant.log");
+        let marker = workspace.join("descendant-survived");
+        let step = StepConfig {
+            name: "spawn-child".to_string(),
+            run: format!(
+                "(sleep 0.5; echo unexpected > '{}') & exit 0",
+                marker.display()
+            ),
+            working_directory: None,
+            timeout_minutes: None,
+            env: Default::default(),
+        };
+
+        let started = Instant::now();
+        let outcome = run_step(&step, workspace, &log_path, Some(3)).unwrap();
+
+        assert_eq!(outcome.status, StepStatus::Succeeded);
+        assert!(started.elapsed() < Duration::from_millis(400));
+        thread::sleep(Duration::from_millis(600));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn timeout_terminates_same_group_descendants() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let log_path = workspace.join("timeout-descendant.log");
+        let marker = workspace.join("timeout-descendant-survived");
+        let step = StepConfig {
+            name: "spawn-child".to_string(),
+            run: format!(
+                "(sleep 1.3; echo unexpected > '{}') & sleep 10",
+                marker.display()
+            ),
+            working_directory: None,
+            timeout_minutes: None,
+            env: Default::default(),
+        };
+
+        let outcome = run_step(&step, workspace, &log_path, Some(1)).unwrap();
+
+        assert_eq!(outcome.status, StepStatus::TimedOut);
+        thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists());
     }
 }

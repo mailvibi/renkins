@@ -26,4 +26,4 @@ cargo run -- --help
 
 ## Trust model and current limitations
 
-This is not a Jenkins-compatible replacement. It is intentionally limited to a single-node, localhost-first CI flow with a dedicated service account and minimal execution surface. The design and first implementation still require the remaining executor, scheduler, auth, and network hardening work from the plan before it is safe to run untrusted repositories.
+This is not a Jenkins-compatible replacement. It is intentionally limited to a single-node, localhost-first CI flow with a dedicated service account and minimal execution surface. Commands run as that service account, not in a security sandbox. The step executor terminates children in its process group, but deliberately detached processes are outside that cleanup guarantee and are unsupported. The design and first implementation still require the remaining executor, scheduler, auth, and network hardening work from the plan before it is safe to run untrusted repositories.
