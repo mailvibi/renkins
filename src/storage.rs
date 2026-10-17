@@ -5,11 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_job_build_numbers.sql")),
     (3, include_str!("../migrations/0003_pipeline_snapshots.sql")),
+    (4, include_str!("../migrations/0004_build_recovery.sql")),
 ];
 const MAX_PAGE_SIZE: u32 = 100;
 
@@ -201,6 +202,18 @@ impl DatabaseStore {
             .map_err(|err| format!("failed to get build: {err}"))
     }
 
+    pub fn recover_abandoned_builds(&self) -> Result<usize, String> {
+        let now = Self::now_unix_millis()?;
+        self.conn
+            .execute(
+                "UPDATE builds
+                 SET status = 'interrupted', finished_at = ?1, failure_kind = 'server_crash'
+                 WHERE status IN ('preparing', 'running', 'cancelling')",
+                [now],
+            )
+            .map_err(|err| format!("failed to recover abandoned builds: {err}"))
+    }
+
     pub fn claim_next_build(&mut self) -> Result<Option<Build>, String> {
         let transaction = self
             .conn
@@ -335,13 +348,23 @@ impl DatabaseStore {
         let changed = self
             .conn
             .execute(
-                "UPDATE builds SET status = ?1
+                "UPDATE builds
+                 SET status = ?1,
+                     finished_at = CASE
+                         WHEN ?1 IN ('succeeded', 'failed', 'cancelled', 'interrupted') THEN ?4
+                         ELSE finished_at
+                     END
                  WHERE id = ?2 AND status = ?3
                  AND (?1 != 'running' OR (
                      pipeline_snapshot IS NOT NULL
                      AND EXISTS (SELECT 1 FROM build_steps WHERE build_id = ?2)
                  ))",
-                params![Self::status_as_str(next), id, Self::status_as_str(expected)],
+                params![
+                    Self::status_as_str(next),
+                    id,
+                    Self::status_as_str(expected),
+                    Self::now_unix_millis()?
+                ],
             )
             .map_err(|err| format!("failed to transition build: {err}"))?;
         Ok(changed == 1)
@@ -667,6 +690,83 @@ mod tests {
             ]
         );
         assert!(!store.persist_pipeline_and_start("build-1", yaml).unwrap());
+        assert!(
+            store
+                .transition_build("build-1", BuildStatus::Running, BuildStatus::Succeeded)
+                .unwrap()
+        );
+        let finished_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT finished_at FROM builds WHERE id = 'build-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(finished_at.is_some());
+    }
+
+    #[test]
+    fn startup_recovery_interrupts_active_builds_and_preserves_queued_work() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("renkins.sqlite3");
+        let mut store = DatabaseStore::open(&db_path).unwrap();
+        store.initialize_schema().unwrap();
+        store.create_job(&test_job("job-1", "demo")).unwrap();
+        store
+            .enqueue_build("build-1", "job-1", "refs/heads/main")
+            .unwrap();
+        store
+            .enqueue_build("build-2", "job-1", "refs/heads/main")
+            .unwrap();
+        store
+            .enqueue_build("build-3", "job-1", "refs/heads/main")
+            .unwrap();
+        store.claim_next_build().unwrap().unwrap();
+        store.claim_next_build().unwrap().unwrap();
+        assert!(
+            store
+                .persist_pipeline_and_start(
+                    "build-2",
+                    "version: 1\nsteps:\n  - name: test\n    run: cargo test\n"
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .transition_build("build-2", BuildStatus::Running, BuildStatus::Cancelling)
+                .unwrap()
+        );
+        drop(store);
+
+        let store = DatabaseStore::open(&db_path).unwrap();
+        assert_eq!(store.recover_abandoned_builds().unwrap(), 2);
+        assert_eq!(
+            store.get_build("build-1").unwrap().unwrap().status,
+            BuildStatus::Interrupted
+        );
+        assert_eq!(
+            store.get_build("build-3").unwrap().unwrap().status,
+            BuildStatus::Queued
+        );
+        let recovered: (Option<i64>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT finished_at, failure_kind FROM builds WHERE id = 'build-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(recovered.0.is_some());
+        assert_eq!(recovered.1.as_deref(), Some("server_crash"));
+
+        drop(store);
+        let claimed = DatabaseStore::open(&db_path)
+            .unwrap()
+            .claim_next_build()
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, "build-3");
     }
 
     #[test]
