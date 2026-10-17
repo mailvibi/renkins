@@ -1,6 +1,15 @@
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::{os::unix::process::CommandExt, process::Output};
+
+const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const MAX_CAPTURED_OUTPUT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitRefError {
@@ -9,6 +18,8 @@ pub enum GitRefError {
     InvalidCommitId,
     RefNotFound,
     NotACommit,
+    CommandFailed(String),
+    TimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,14 +76,15 @@ pub fn prepare_workspace(data_dir: &Path, build_id: &str) -> Result<PathBuf, std
 pub fn resolve_commit(repo_path: &Path, reference: &str) -> Result<String, GitRefError> {
     validate_ref(reference)?;
 
-    let output = Command::new("git")
-        .args(["-C", repo_path.to_str().unwrap()])
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo_path)
         .arg("rev-parse")
         .arg("--verify")
         .arg("--quiet")
-        .arg(format!("{reference}^{{commit}}"))
-        .output()
-        .map_err(|_| GitRefError::RefNotFound)?;
+        .arg(format!("{reference}^{{commit}}"));
+    configure_git_environment(&mut command);
+    let output = run_git_command(command, GIT_COMMAND_TIMEOUT)?;
 
     if !output.status.success() {
         return Err(GitRefError::RefNotFound);
@@ -97,39 +109,168 @@ pub fn checkout_repository(
         fs::remove_dir_all(workspace).map_err(|_| GitRefError::RefNotFound)?;
     }
 
-    let status = Command::new("git")
+    let mut clone = Command::new("git");
+    clone
         .arg("clone")
         .arg("--quiet")
+        .arg("--no-recurse-submodules")
+        .arg("--")
         .arg(repo_url)
-        .arg(workspace)
-        .status()
-        .map_err(|_| GitRefError::RefNotFound)?;
+        .arg(workspace);
+    configure_git_environment(&mut clone);
+    let output = run_git_command(clone, CLONE_TIMEOUT)?;
 
-    if !status.success() {
-        return Err(GitRefError::RefNotFound);
+    if !output.status.success() {
+        return Err(command_failure("git clone", &output));
     }
 
     let resolved_commit = resolve_commit(workspace, reference)?;
 
-    let checkout_status = Command::new("git")
-        .args([
-            "-C",
-            workspace.to_str().unwrap(),
-            "checkout",
-            "--detach",
-            &resolved_commit,
-        ])
-        .status()
-        .map_err(|_| GitRefError::RefNotFound)?;
+    let mut checkout = Command::new("git");
+    checkout
+        .current_dir(workspace)
+        .args(["checkout", "--detach", "--quiet"])
+        .arg(&resolved_commit);
+    configure_git_environment(&mut checkout);
+    let output = run_git_command(checkout, GIT_COMMAND_TIMEOUT)?;
 
-    if !checkout_status.success() {
-        return Err(GitRefError::NotACommit);
+    if !output.status.success() {
+        return Err(command_failure("git checkout", &output));
     }
 
     Ok(CheckoutResult {
         workspace: workspace.to_path_buf(),
         resolved_commit,
     })
+}
+
+fn configure_git_environment(command: &mut Command) {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .process_group(0);
+}
+
+fn run_git_command(mut command: Command, timeout: Duration) -> Result<Output, GitRefError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|err| GitRefError::CommandFailed(format!("failed to start git: {err}")))?;
+    let process_group = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitRefError::CommandFailed("git stdout was not captured".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| GitRefError::CommandFailed("git stderr was not captured".to_string()))?;
+    let stdout_reader = thread::spawn(move || read_capped(stdout));
+    let stderr_reader = thread::spawn(move || read_capped(stderr));
+    let deadline = Instant::now() + timeout;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let termination = terminate_process_group(&mut child, process_group);
+                let _ = (join_reader(stdout_reader)?, join_reader(stderr_reader)?);
+                termination?;
+                return Err(GitRefError::TimedOut);
+            }
+            Err(err) => {
+                let termination = terminate_process_group(&mut child, process_group);
+                let _ = (join_reader(stdout_reader)?, join_reader(stderr_reader)?);
+                termination?;
+                return Err(GitRefError::CommandFailed(format!(
+                    "failed while waiting for git: {err}"
+                )));
+            }
+        }
+    };
+
+    terminate_process_group(&mut child, process_group)?;
+    let stdout = join_reader(stdout_reader)?;
+    let stderr = join_reader(stderr_reader)?;
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_capped(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let bytes = reader.read(&mut buffer)?;
+        if bytes == 0 {
+            return Ok(captured);
+        }
+        let remaining = MAX_CAPTURED_OUTPUT.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..bytes.min(remaining)]);
+    }
+}
+
+fn join_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, GitRefError> {
+    reader
+        .join()
+        .map_err(|_| GitRefError::CommandFailed("git output reader panicked".to_string()))?
+        .map_err(|err| GitRefError::CommandFailed(format!("failed to read git output: {err}")))
+}
+
+fn terminate_process_group(child: &mut Child, process_group: u32) -> Result<(), GitRefError> {
+    if signal_process_group(process_group, libc::SIGTERM)? {
+        thread::sleep(PROCESS_TERMINATION_GRACE);
+        signal_process_group(process_group, libc::SIGKILL)?;
+    }
+    if child
+        .try_wait()
+        .map_err(|err| GitRefError::CommandFailed(format!("failed to wait for git: {err}")))?
+        .is_none()
+    {
+        child
+            .kill()
+            .map_err(|err| GitRefError::CommandFailed(format!("failed to stop git: {err}")))?;
+    }
+    child
+        .wait()
+        .map_err(|err| GitRefError::CommandFailed(format!("failed to reap git: {err}")))?;
+    Ok(())
+}
+
+fn signal_process_group(process_group: u32, signal: i32) -> Result<bool, GitRefError> {
+    let process_group = libc::pid_t::try_from(process_group)
+        .map_err(|err| GitRefError::CommandFailed(err.to_string()))?;
+    let result = unsafe { libc::kill(-process_group, signal) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(GitRefError::CommandFailed(format!(
+            "failed to signal git process group {process_group}: {error}"
+        )))
+    }
+}
+
+fn command_failure(operation: &str, output: &Output) -> GitRefError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        GitRefError::CommandFailed(format!("{operation} exited with {}", output.status))
+    } else {
+        GitRefError::CommandFailed(format!("{operation} failed: {stderr}"))
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +307,33 @@ mod tests {
             validate_ref("0123456"),
             Err(GitRefError::InvalidSyntax)
         ));
+    }
+
+    #[test]
+    fn git_commands_time_out_and_reap_their_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 10");
+        configure_git_environment(&mut command);
+
+        let started = Instant::now();
+        assert!(matches!(
+            run_git_command(command, Duration::from_millis(100)),
+            Err(GitRefError::TimedOut)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn git_command_failures_include_captured_stderr() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf 'failure detail' >&2; exit 7");
+        configure_git_environment(&mut command);
+
+        let output = run_git_command(command, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            command_failure("git test", &output),
+            GitRefError::CommandFailed("git test failed: failure detail".to_string())
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ Renkins is a Rust-based single-node CI engine prototype inspired by the first-re
 - Build state transition rules for queued, preparing, running, cancelling, and terminal states
 - SQLite schema creation and job/build persistence in a local database
 - Local Git ref validation and checkout into an isolated workspace for fully-qualified refs and full commit IDs
+- Git clone/checkout commands run without interactive prompts, have bounded execution time, and terminate their process groups on timeout
 - Ordered shell step execution with timeout handling and append-only log output
 - Bounded in-memory queue scheduling with concurrency limits and cancellation handling
 - Restart recovery and graceful shutdown bookkeeping for interrupted builds and queued work
@@ -26,4 +27,4 @@ cargo run -- --help
 
 ## Trust model and current limitations
 
-This is not a Jenkins-compatible replacement. It is intentionally limited to a single-node, localhost-first CI flow with a dedicated service account and minimal execution surface. Commands run as that service account, not in a security sandbox. The step executor terminates children in its process group, but deliberately detached processes are outside that cleanup guarantee and are unsupported. The design and first implementation still require the remaining executor, scheduler, auth, and network hardening work from the plan before it is safe to run untrusted repositories.
+This is not a Jenkins-compatible replacement. It is intentionally limited to a single-node, localhost-first CI flow with a dedicated service account and minimal execution surface. Commands run as that service account, not in a security sandbox. Git clone is limited to five minutes and other Git operations to thirty seconds; timed-out Git children are terminated with their process groups. The step executor likewise terminates children in its process group, but deliberately detached processes are outside that cleanup guarantee and are unsupported. Durable worker dispatch is not yet wired to the server, and the design and first implementation still require the remaining executor, scheduler, auth, and network hardening work from the plan before it is safe to run untrusted repositories.
