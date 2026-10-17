@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -14,7 +14,7 @@ use crate::api::{
     BuildEnqueueRequest, JobCreateRequest, JobResponse, create_job, validate_build_ref,
 };
 use crate::config::{ServerConfig, read_or_create_token_file, validate_token_header};
-use crate::domain::Job;
+use crate::domain::{Build, BuildStatus, Job};
 use crate::storage::{DatabaseStore, EnqueueBuildError};
 
 #[derive(Clone, Debug)]
@@ -35,7 +35,14 @@ pub fn build_router_with_store(expected_token: &str, store: DatabaseStore) -> Ro
         .route("/readyz", get(healthcheck))
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs", post(create_job_route))
-        .route("/api/v1/jobs/{job_id}/builds", post(enqueue_build_route))
+        .route("/api/v1/jobs/{job_id}", get(get_job_route))
+        .route("/api/v1/jobs/{job_id}/disable", post(disable_job_route))
+        .route("/api/v1/jobs/{job_id}/enable", post(enable_job_route))
+        .route(
+            "/api/v1/jobs/{job_id}/builds",
+            get(list_builds_route).post(enqueue_build_route),
+        )
+        .route("/api/v1/builds/{build_id}", get(get_build_route))
         .with_state(AppState {
             token: expected_token.to_string(),
             store: Arc::new(Mutex::new(store)),
@@ -81,12 +88,9 @@ async fn healthcheck() -> StatusCode {
 async fn list_jobs(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(page): Query<PageParams>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    let header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-
-    if !state.has_valid_authorization(header) {
+    if !authorized(&state, &headers) {
         return Err(unauthorized_response());
     }
 
@@ -94,13 +98,164 @@ async fn list_jobs(
         .store
         .lock()
         .map_err(|_| internal_error_response())?
-        .list_jobs(100, 0)
-        .map_err(|_| internal_error_response())?
+        .list_jobs(page.limit, page.offset)
+        .map_err(|_| invalid_pagination_response())?
         .into_iter()
         .map(job_response)
         .collect::<Vec<_>>();
 
     Ok(Json(json!(jobs)).into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PageParams {
+    #[serde(default = "default_page_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+}
+
+fn default_page_limit() -> u32 {
+    50
+}
+
+async fn get_job_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&state, &headers) {
+        return Err(unauthorized_response());
+    }
+    let job = state
+        .store
+        .lock()
+        .map_err(|_| internal_error_response())?
+        .get_job(&job_id)
+        .map_err(|_| internal_error_response())?;
+    match job {
+        Some(job) => Ok(Json(job_response(job)).into_response()),
+        None => Ok(not_found_response("job_not_found", "job does not exist")),
+    }
+}
+
+async fn disable_job_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    set_job_disabled(state, headers, job_id, true).await
+}
+
+async fn enable_job_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    set_job_disabled(state, headers, job_id, false).await
+}
+
+async fn set_job_disabled(
+    state: AppState,
+    headers: HeaderMap,
+    job_id: String,
+    disabled: bool,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&state, &headers) {
+        return Err(unauthorized_response());
+    }
+    let store = state.store.lock().map_err(|_| internal_error_response())?;
+    if !store
+        .set_job_disabled(&job_id, disabled)
+        .map_err(|_| internal_error_response())?
+    {
+        return Ok(not_found_response("job_not_found", "job does not exist"));
+    }
+    let job = store
+        .get_job(&job_id)
+        .map_err(|_| internal_error_response())?
+        .ok_or_else(internal_error_response)?;
+    Ok(Json(job_response(job)).into_response())
+}
+
+async fn list_builds_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(job_id): AxumPath<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&state, &headers) {
+        return Err(unauthorized_response());
+    }
+    let store = state.store.lock().map_err(|_| internal_error_response())?;
+    if store
+        .get_job(&job_id)
+        .map_err(|_| internal_error_response())?
+        .is_none()
+    {
+        return Ok(not_found_response("job_not_found", "job does not exist"));
+    }
+    let builds = store
+        .list_builds(&job_id, page.limit, page.offset)
+        .map_err(|_| invalid_pagination_response())?;
+    Ok(Json(json!(builds.iter().map(build_response).collect::<Vec<_>>())).into_response())
+}
+
+async fn get_build_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(build_id): AxumPath<String>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&state, &headers) {
+        return Err(unauthorized_response());
+    }
+    let store = state.store.lock().map_err(|_| internal_error_response())?;
+    let Some(build) = store
+        .get_build(&build_id)
+        .map_err(|_| internal_error_response())?
+    else {
+        return Ok(not_found_response(
+            "build_not_found",
+            "build does not exist",
+        ));
+    };
+    let snapshot = store
+        .get_pipeline_snapshot(&build_id)
+        .map_err(|_| internal_error_response())?;
+    Ok(Json(json!({
+        "id": build.id,
+        "job_id": build.job_id,
+        "number": build.number,
+        "requested_ref": build.requested_ref,
+        "status": build_status(build.status),
+        "pipeline": snapshot
+    }))
+    .into_response())
+}
+
+fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    state.has_valid_authorization(header)
+}
+
+fn not_found_response(code: &'static str, message: &'static str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "code": code, "message": message })),
+    )
+        .into_response()
+}
+
+fn invalid_pagination_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "code": "invalid_pagination",
+            "message": "limit must be between 1 and 100"
+        })),
+    )
 }
 
 async fn create_job_route(
@@ -241,6 +396,29 @@ fn job_response(job: Job) -> JobResponse {
         repository_url: job.repository_url,
         default_ref: job.default_ref,
         disabled: job.disabled,
+    }
+}
+
+fn build_response(build: &Build) -> serde_json::Value {
+    json!({
+        "id": build.id,
+        "job_id": build.job_id,
+        "number": build.number,
+        "requested_ref": build.requested_ref,
+        "status": build_status(build.status)
+    })
+}
+
+fn build_status(status: BuildStatus) -> &'static str {
+    match status {
+        BuildStatus::Queued => "queued",
+        BuildStatus::Preparing => "preparing",
+        BuildStatus::Running => "running",
+        BuildStatus::Cancelling => "cancelling",
+        BuildStatus::Succeeded => "succeeded",
+        BuildStatus::Failed => "failed",
+        BuildStatus::Cancelled => "cancelled",
+        BuildStatus::Interrupted => "interrupted",
     }
 }
 
@@ -395,6 +573,81 @@ mod tests {
         let enqueue_body = to_bytes(enqueue.into_body(), usize::MAX).await.unwrap();
         let enqueue_json: serde_json::Value = serde_json::from_slice(&enqueue_body).unwrap();
         assert_eq!(enqueue_json["number"], 1);
+
+        let job_detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/jobs/{job_id}"))
+                    .header("Authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(job_detail.status(), StatusCode::OK);
+
+        let builds = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/jobs/{job_id}/builds?limit=10"))
+                    .header("Authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(builds.status(), StatusCode::OK);
+        let builds_body = to_bytes(builds.into_body(), usize::MAX).await.unwrap();
+        let builds_json: serde_json::Value = serde_json::from_slice(&builds_body).unwrap();
+        assert_eq!(builds_json[0]["status"], "queued");
+
+        let build_id = enqueue_json["id"].as_str().unwrap();
+        let build_detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/builds/{build_id}"))
+                    .header("Authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(build_detail.status(), StatusCode::OK);
+
+        for (action, expected_disabled) in [("disable", true), ("enable", false)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/jobs/{job_id}/{action}"))
+                        .method("POST")
+                        .header("Authorization", "Bearer secret-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["disabled"], expected_disabled);
+        }
+
+        let invalid_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/jobs/{job_id}/builds?limit=101"))
+                    .header("Authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_page.status(), StatusCode::BAD_REQUEST);
 
         drop(app);
         let mut store = DatabaseStore::open(&db_path).unwrap();

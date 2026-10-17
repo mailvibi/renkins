@@ -2,15 +2,15 @@
 
 ## Current handoff
 
-The latest session connected core HTTP operations to SQLite:
+The latest session completed persistent job/build inspection routes:
 
-- Server startup now opens the data directory's `renkins.sqlite3`, applies migrations, and recovers abandoned active builds before serving.
-- Authenticated job creation/listing and build enqueue now use the persistent store; build IDs are unique, job defaults apply when request refs are omitted, and disabled jobs reject enqueue.
-- API build refs now require a fully qualified branch/tag ref or full commit ID.
-- Added an HTTP persistence test that creates a job and build, reopens SQLite, and verifies the records and queued status survive.
+- Added authenticated job detail, enable/disable, paginated build history, and build detail routes backed by SQLite.
+- Added bounded `limit`/`offset` query handling for job and build listings; invalid page limits receive stable `invalid_pagination` JSON errors.
+- Build detail exposes persisted pipeline snapshot when one exists; build history returns stable status strings.
+- Added route assertions for history/detail, job disable/enable, and invalid pagination.
 - Validation passed: `cargo test --all-targets` (40 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo fmt --check`.
 
-The preceding persistence steps implemented schema migrations, durable job/build storage, conditional claims, plan persistence, and abandoned-build recovery; those are committed separately.
+Earlier committed work connected create/list/enqueue routes to SQLite and performs schema migrations plus abandoned-build recovery before server startup.
 
 The earlier server fix in `src/server.rs` changed the captured route segment to `{job_id}` and unwraps the extracted path before job lookup. It fixed compilation and router construction.
 
@@ -18,10 +18,10 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-The HTTP API now persists job creation and build enqueue, but there is not yet a durable scheduler worker dispatching builds, nor build detail/history/cancel/log routes. Readiness still does not reflect scheduler state. Next roadmap slice: connect a worker loop to durable claim, checkout, pipeline snapshot, step execution, and terminal persistence; then add build inspection/cancellation and readiness signals. Continue comparing implementation with [PLAN.md](./PLAN.md) and verify acceptance criteria before declaring a phase complete.
+The HTTP API does not yet provide cancellation or log retrieval, and no durable scheduler worker dispatches queued builds. Build details do not yet contain full step outcomes/timing. Readiness still does not reflect scheduler state. Next roadmap slice: connect a worker loop to durable claim, checkout, pipeline snapshot, step execution, and terminal persistence with safe process-group cleanup. Continue comparing implementation with [PLAN.md](./PLAN.md) and verify acceptance criteria before declaring a phase complete.
 
 ## Continuation and commits
 
 - Keep the main branch compiling and tested after each logical implementation step.
 - Commit each independently completed implementation step with its tests and directly related documentation.
-- SQLite schema version is 4. Server startup invokes persisted recovery; API job creation/listing and enqueue use SQLite. This remains a partial integration, not completion of scheduler or Phase 2/6.
+- SQLite schema version is 4. Server startup invokes persisted recovery; job and build inspection/control routes implemented so far use SQLite. This remains partial coverage of Phase 6, not completion of the scheduler.
