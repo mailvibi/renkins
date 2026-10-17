@@ -1,13 +1,15 @@
 use crate::domain::{Build, Job};
+use crate::pipeline::{PipelineConfig, parse_pipeline_yaml};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_job_build_numbers.sql")),
+    (3, include_str!("../migrations/0003_pipeline_snapshots.sql")),
 ];
 const MAX_PAGE_SIZE: u32 = 100;
 
@@ -199,6 +201,110 @@ impl DatabaseStore {
             .map_err(|err| format!("failed to get build: {err}"))
     }
 
+    pub fn claim_next_build(&mut self) -> Result<Option<Build>, String> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| format!("failed to begin queue claim transaction: {err}"))?;
+        let build = transaction
+            .query_row(
+                "UPDATE builds
+                 SET status = 'preparing'
+                 WHERE id = (
+                     SELECT id FROM builds
+                     WHERE status = 'queued'
+                     ORDER BY created_at, id
+                     LIMIT 1
+                 )
+                 AND status = 'queued'
+                 RETURNING id, job_id, number, requested_ref, status",
+                [],
+                Self::build_from_row,
+            )
+            .optional()
+            .map_err(|err| format!("failed to claim queued build: {err}"))?;
+        transaction
+            .commit()
+            .map_err(|err| format!("failed to commit queue claim: {err}"))?;
+        Ok(build)
+    }
+
+    pub fn persist_pipeline_and_start(
+        &mut self,
+        build_id: &str,
+        pipeline_yaml: &str,
+    ) -> Result<bool, String> {
+        let pipeline = parse_pipeline_yaml(pipeline_yaml)
+            .map_err(|err| format!("invalid pipeline configuration: {err:?}"))?;
+        let snapshot = serde_json::to_string(&pipeline)
+            .map_err(|err| format!("failed to serialize pipeline snapshot: {err}"))?;
+        let transaction = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| format!("failed to begin pipeline persistence transaction: {err}"))?;
+        let current: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT status, pipeline_snapshot FROM builds WHERE id = ?1",
+                [build_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|err| format!("failed to inspect build before saving pipeline: {err}"))?;
+        if current != Some(("preparing".to_string(), None)) {
+            transaction.commit().map_err(|err| {
+                format!("failed to finish pipeline persistence transaction: {err}")
+            })?;
+            return Ok(false);
+        }
+
+        for (step_index, step) in pipeline.steps.iter().enumerate() {
+            let step_index = i64::try_from(step_index)
+                .map_err(|err| format!("pipeline step index is outside SQLite range: {err}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO build_steps (build_id, step_index, name, command, status)
+                     VALUES (?1, ?2, ?3, ?4, 'pending')",
+                    params![build_id, step_index, step.name, step.run],
+                )
+                .map_err(|err| format!("failed to persist pipeline step: {err}"))?;
+        }
+
+        let changed = transaction
+            .execute(
+                "UPDATE builds
+                 SET pipeline_snapshot = ?1, status = 'running'
+                 WHERE id = ?2 AND status = 'preparing' AND pipeline_snapshot IS NULL",
+                params![snapshot, build_id],
+            )
+            .map_err(|err| format!("failed to start build after saving pipeline: {err}"))?;
+        if changed != 1 {
+            return Err("build state changed while saving its pipeline".to_string());
+        }
+        transaction
+            .commit()
+            .map_err(|err| format!("failed to commit pipeline persistence transaction: {err}"))?;
+        Ok(true)
+    }
+
+    pub fn get_pipeline_snapshot(&self, build_id: &str) -> Result<Option<PipelineConfig>, String> {
+        let snapshot: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pipeline_snapshot FROM builds WHERE id = ?1",
+                [build_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to read pipeline snapshot: {err}"))?
+            .flatten();
+        snapshot
+            .map(|snapshot| {
+                serde_json::from_str(&snapshot)
+                    .map_err(|err| format!("stored pipeline snapshot is invalid: {err}"))
+            })
+            .transpose()
+    }
+
     pub fn list_builds(&self, job_id: &str, limit: u32, offset: u32) -> Result<Vec<Build>, String> {
         Self::validate_page(limit)?;
         let mut statement = self
@@ -229,7 +335,12 @@ impl DatabaseStore {
         let changed = self
             .conn
             .execute(
-                "UPDATE builds SET status = ?1 WHERE id = ?2 AND status = ?3",
+                "UPDATE builds SET status = ?1
+                 WHERE id = ?2 AND status = ?3
+                 AND (?1 != 'running' OR (
+                     pipeline_snapshot IS NOT NULL
+                     AND EXISTS (SELECT 1 FROM build_steps WHERE build_id = ?2)
+                 ))",
                 params![Self::status_as_str(next), id, Self::status_as_str(expected)],
             )
             .map_err(|err| format!("failed to transition build: {err}"))?;
@@ -436,6 +547,11 @@ mod tests {
                 .transition_build("build-1", BuildStatus::Preparing, BuildStatus::Succeeded)
                 .is_err()
         );
+        assert!(
+            !store
+                .transition_build("build-1", BuildStatus::Preparing, BuildStatus::Running)
+                .unwrap()
+        );
         assert!(store.set_job_disabled("job-1", true).unwrap());
         assert!(
             store
@@ -444,6 +560,113 @@ mod tests {
         );
         assert!(store.get_job("job-1").unwrap().unwrap().disabled);
         assert!(!store.set_job_disabled("unknown", true).unwrap());
+    }
+
+    #[test]
+    fn competing_claimers_cannot_claim_the_same_queued_build() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("renkins.sqlite3");
+        let mut store = DatabaseStore::open(&db_path).unwrap();
+        store.initialize_schema().unwrap();
+        store.create_job(&test_job("job-1", "demo")).unwrap();
+        store
+            .enqueue_build("build-1", "job-1", "refs/heads/main")
+            .unwrap();
+        drop(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let claimers = (0..2)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut store = DatabaseStore::open(db_path).unwrap();
+                    barrier.wait();
+                    store.claim_next_build().unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let claims = claimers
+            .into_iter()
+            .map(|claimer| claimer.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+        assert_eq!(
+            DatabaseStore::open(&db_path)
+                .unwrap()
+                .get_build("build-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            BuildStatus::Preparing
+        );
+    }
+
+    #[test]
+    fn validated_pipeline_and_pending_steps_commit_before_running() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("renkins.sqlite3");
+        let mut store = DatabaseStore::open(&db_path).unwrap();
+        store.initialize_schema().unwrap();
+        store.create_job(&test_job("job-1", "demo")).unwrap();
+        store
+            .enqueue_build("build-1", "job-1", "refs/heads/main")
+            .unwrap();
+        store.claim_next_build().unwrap().unwrap();
+
+        let invalid = "version: 1\nsteps: []\n";
+        assert!(
+            store
+                .persist_pipeline_and_start("build-1", invalid)
+                .is_err()
+        );
+        assert_eq!(
+            store.get_build("build-1").unwrap().unwrap().status,
+            BuildStatus::Preparing
+        );
+
+        let yaml = "version: 1\nsteps:\n  - name: test\n    run: cargo test\n  - name: lint\n    run: cargo clippy\n";
+        assert!(store.persist_pipeline_and_start("build-1", yaml).unwrap());
+        assert_eq!(
+            store.get_build("build-1").unwrap().unwrap().status,
+            BuildStatus::Running
+        );
+        let pipeline = store.get_pipeline_snapshot("build-1").unwrap().unwrap();
+        assert_eq!(pipeline.steps.len(), 2);
+        let steps: Vec<(i64, String, String, String)> = {
+            let mut statement = store
+                .conn
+                .prepare(
+                    "SELECT step_index, name, command, status
+                     FROM build_steps WHERE build_id = ?1 ORDER BY step_index",
+                )
+                .unwrap();
+            statement
+                .query_map(["build-1"], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            steps,
+            vec![
+                (
+                    0,
+                    "test".to_string(),
+                    "cargo test".to_string(),
+                    "pending".to_string()
+                ),
+                (
+                    1,
+                    "lint".to_string(),
+                    "cargo clippy".to_string(),
+                    "pending".to_string()
+                ),
+            ]
+        );
+        assert!(!store.persist_pipeline_and_start("build-1", yaml).unwrap());
     }
 
     #[test]
