@@ -2,15 +2,15 @@
 
 ## Current handoff
 
-The latest session added durable startup recovery:
+The latest session connected core HTTP operations to SQLite:
 
-- Added migration `0004_build_recovery.sql` with build finish time and failure kind fields.
-- Added recovery that marks `preparing`, `running`, and `cancelling` builds as `interrupted` with `server_crash`, while preserving queued builds.
-- Terminal build transitions now persist `finished_at`.
-- Tested recovery after reopening the database, including preparing and cancelling builds plus subsequent claiming of queued work.
-- Validation passed: `cargo test --all-targets` (39 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo fmt --check`.
+- Server startup now opens the data directory's `renkins.sqlite3`, applies migrations, and recovers abandoned active builds before serving.
+- Authenticated job creation/listing and build enqueue now use the persistent store; build IDs are unique, job defaults apply when request refs are omitted, and disabled jobs reject enqueue.
+- API build refs now require a fully qualified branch/tag ref or full commit ID.
+- Added an HTTP persistence test that creates a job and build, reopens SQLite, and verifies the records and queued status survive.
+- Validation passed: `cargo test --all-targets` (40 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo fmt --check`.
 
-The preceding persistence steps added transactional build-number allocation, job/build lookup and bounded listing, conditional queue claiming, and validated pipeline snapshot plus pending-step persistence before entering `running`. They are committed separately.
+The preceding persistence steps implemented schema migrations, durable job/build storage, conditional claims, plan persistence, and abandoned-build recovery; those are committed separately.
 
 The earlier server fix in `src/server.rs` changed the captured route segment to `{job_id}` and unwraps the extracted path before job lookup. It fixed compilation and router construction.
 
@@ -18,10 +18,10 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-The HTTP server and in-memory scheduler still are not wired to `DatabaseStore`, so the new recovery operation is not yet called during actual server startup. Next roadmap slice: integrate durable storage into server/scheduler startup, enqueue, claim, execution, and readiness flows, then cover recovery end to end. Continue comparing implementation with [PLAN.md](./PLAN.md) and verify the roadmap acceptance criteria before declaring a phase complete.
+The HTTP API now persists job creation and build enqueue, but there is not yet a durable scheduler worker dispatching builds, nor build detail/history/cancel/log routes. Readiness still does not reflect scheduler state. Next roadmap slice: connect a worker loop to durable claim, checkout, pipeline snapshot, step execution, and terminal persistence; then add build inspection/cancellation and readiness signals. Continue comparing implementation with [PLAN.md](./PLAN.md) and verify acceptance criteria before declaring a phase complete.
 
 ## Continuation and commits
 
 - Keep the main branch compiling and tested after each logical implementation step.
 - Commit each independently completed implementation step with its tests and directly related documentation.
-- SQLite schema version is now 4. Build numbers are allocated transactionally; claim transitions and the snapshot/steps-to-running transition are atomic, and active builds can be marked interrupted during startup recovery.
+- SQLite schema version is 4. Server startup invokes persisted recovery; API job creation/listing and enqueue use SQLite. This remains a partial integration, not completion of scheduler or Phase 2/6.

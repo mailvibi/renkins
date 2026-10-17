@@ -72,6 +72,12 @@ pub fn validate_build_ref(reference: Option<&str>) -> Result<Option<String>, Api
             message: "ref must not be empty".to_string(),
         });
     }
+    if crate::git::validate_ref(reference).is_err() {
+        return Err(ApiError {
+            code: "invalid_ref",
+            message: "ref must be a fully qualified branch/tag ref or full commit ID".to_string(),
+        });
+    }
 
     Ok(Some(reference.to_string()))
 }
@@ -153,6 +159,9 @@ mod tests {
                 ..
             })
         ));
+
+        assert!(validate_build_ref(Some("main")).is_err());
+        assert!(validate_build_ref(Some("refs/heads/main")).is_ok());
     }
 
     #[test]

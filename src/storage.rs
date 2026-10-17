@@ -14,6 +14,12 @@ const MIGRATIONS: &[(i32, &str)] = &[
 ];
 const MAX_PAGE_SIZE: u32 = 100;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnqueueBuildError {
+    JobNotFoundOrDisabled,
+    Storage(String),
+}
+
 #[derive(Debug)]
 pub struct DatabaseStore {
     pub path: PathBuf,
@@ -30,6 +36,16 @@ impl DatabaseStore {
 
         let conn = Connection::open(path)
             .map_err(|err| format!("failed to open sqlite database {path:?}: {err}"))?;
+        Self::from_connection(path.to_path_buf(), conn)
+    }
+
+    pub fn open_in_memory() -> Result<Self, String> {
+        let conn = Connection::open_in_memory()
+            .map_err(|err| format!("failed to open in-memory sqlite database: {err}"))?;
+        Self::from_connection(PathBuf::from(":memory:"), conn)
+    }
+
+    fn from_connection(path: PathBuf, conn: Connection) -> Result<Self, String> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
         )
@@ -37,10 +53,7 @@ impl DatabaseStore {
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|err| format!("failed to configure sqlite busy timeout: {err}"))?;
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            conn,
-        })
+        Ok(Self { path, conn })
     }
 
     pub fn initialize_schema(&mut self) -> Result<(), String> {
@@ -150,12 +163,11 @@ impl DatabaseStore {
         id: &str,
         job_id: &str,
         requested_ref: &str,
-    ) -> Result<Build, String> {
-        let now = Self::now_unix_millis()?;
-        let transaction = self
-            .conn
-            .transaction()
-            .map_err(|err| format!("failed to begin build enqueue transaction: {err}"))?;
+    ) -> Result<Build, EnqueueBuildError> {
+        let now = Self::now_unix_millis().map_err(EnqueueBuildError::Storage)?;
+        let transaction = self.conn.transaction().map_err(|err| {
+            EnqueueBuildError::Storage(format!("failed to begin build enqueue transaction: {err}"))
+        })?;
         let number: i64 = transaction
             .query_row(
                 "UPDATE jobs
@@ -166,10 +178,15 @@ impl DatabaseStore {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|err| format!("failed to allocate build number: {err}"))?
-            .ok_or_else(|| format!("job '{job_id}' does not exist or is disabled"))?;
-        let number = u64::try_from(number)
-            .map_err(|_| "allocated build number is outside the supported range".to_string())?;
+            .map_err(|err| {
+                EnqueueBuildError::Storage(format!("failed to allocate build number: {err}"))
+            })?
+            .ok_or(EnqueueBuildError::JobNotFoundOrDisabled)?;
+        let number = u64::try_from(number).map_err(|_| {
+            EnqueueBuildError::Storage(
+                "allocated build number is outside the supported range".to_string(),
+            )
+        })?;
 
         transaction
             .execute(
@@ -177,10 +194,10 @@ impl DatabaseStore {
                  VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
                 params![id, job_id, number, requested_ref, now],
             )
-            .map_err(|err| format!("failed to insert build: {err}"))?;
-        transaction
-            .commit()
-            .map_err(|err| format!("failed to commit build enqueue transaction: {err}"))?;
+            .map_err(|err| EnqueueBuildError::Storage(format!("failed to insert build: {err}")))?;
+        transaction.commit().map_err(|err| {
+            EnqueueBuildError::Storage(format!("failed to commit build enqueue transaction: {err}"))
+        })?;
 
         Ok(Build {
             id: id.to_string(),

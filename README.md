@@ -12,6 +12,7 @@ Renkins is a Rust-based single-node CI engine prototype inspired by the first-re
 - Bounded in-memory queue scheduling with concurrency limits and cancellation handling
 - Restart recovery and graceful shutdown bookkeeping for interrupted builds and queued work
 - API request validation for job creation, build enqueue, and log retrieval
+- Authenticated HTTP job creation/listing and durable build enqueue backed by SQLite
 - CLI bootstrap with `renkins --help`
 
 ## Local development
