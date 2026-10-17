@@ -26,7 +26,7 @@ pub fn build_router(expected_token: &str) -> Router {
         .route("/readyz", get(healthcheck))
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs", post(create_job_route))
-        .route("/api/v1/jobs/:job_id/builds", post(enqueue_build_route))
+        .route("/api/v1/jobs/{job_id}/builds", post(enqueue_build_route))
         .with_state(AppState {
             token: expected_token.to_string(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -145,6 +145,7 @@ async fn enqueue_build_route(
         return Err(unauthorized_response());
     }
 
+    let job_id = job_id.0;
     let Some(_job) = state
         .jobs
         .lock()
