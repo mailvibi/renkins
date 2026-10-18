@@ -1,6 +1,5 @@
+use crate::logs::{BuildLog, LogStream, MAX_RECORD_PAYLOAD};
 use crate::pipeline::StepConfig;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -36,44 +35,24 @@ pub enum ExecutorError {
     TimedOut,
 }
 
-pub fn ensure_log_file(path: &Path) -> Result<(), ExecutorError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| ExecutorError::LogWriteFailed(err.to_string()))?;
-    }
-    File::create(path).map_err(|err| ExecutorError::LogWriteFailed(err.to_string()))?;
-    Ok(())
-}
-
-fn append_line(path: &Path, message: &str) -> Result<(), ExecutorError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| ExecutorError::LogWriteFailed(err.to_string()))?;
-    writeln!(file, "{message}").map_err(|err| ExecutorError::LogWriteFailed(err.to_string()))?;
-    file.flush()
-        .map_err(|err| ExecutorError::LogWriteFailed(err.to_string()))?;
-    Ok(())
-}
-
 fn read_stream<R: std::io::Read + Send + 'static>(
     reader: R,
-    log_path: PathBuf,
-    prefix: String,
+    log: BuildLog,
+    step_index: u32,
+    stream: LogStream,
 ) -> thread::JoinHandle<Result<(), ExecutorError>> {
     thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+        let mut reader = reader;
+        let mut buffer = [0; MAX_RECORD_PAYLOAD];
         loop {
-            line.clear();
             let bytes = reader
-                .read_line(&mut line)
+                .read(&mut buffer)
                 .map_err(|err| ExecutorError::LogWriteFailed(err.to_string()))?;
             if bytes == 0 {
                 break;
             }
-            let payload = format!("[{prefix}] {}", line.trim_end_matches(['\r', '\n']));
-            append_line(&log_path, &payload)?;
+            log.append(Some(step_index), stream, &buffer[..bytes])
+                .map_err(ExecutorError::LogWriteFailed)?;
         }
         Ok(())
     })
@@ -83,6 +62,18 @@ pub fn run_step(
     step: &StepConfig,
     workspace: &Path,
     log_path: &Path,
+    timeout_seconds: Option<u64>,
+) -> Result<StepOutcome, ExecutorError> {
+    let log = BuildLog::open_append(log_path).map_err(ExecutorError::LogWriteFailed)?;
+    run_step_with_log(step, workspace, log_path, &log, 0, timeout_seconds)
+}
+
+fn run_step_with_log(
+    step: &StepConfig,
+    workspace: &Path,
+    log_path: &Path,
+    log: &BuildLog,
+    step_index: u32,
     timeout_seconds: Option<u64>,
 ) -> Result<StepOutcome, ExecutorError> {
     let deadline = match timeout_seconds {
@@ -116,10 +107,8 @@ pub fn run_step(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    let stdout_log = log_path.to_path_buf();
-    let stderr_log = log_path.to_path_buf();
-    let stdout_thread = read_stream(stdout, stdout_log, "stdout".to_string());
-    let stderr_thread = read_stream(stderr, stderr_log, "stderr".to_string());
+    let stdout_thread = read_stream(stdout, log.clone(), step_index, LogStream::Stdout);
+    let stderr_thread = read_stream(stderr, log.clone(), step_index, LogStream::Stderr);
     let process_group = child.id();
 
     loop {
@@ -215,7 +204,7 @@ pub fn execute_pipeline(
     log_path: &Path,
     timeout_seconds: Option<u64>,
 ) -> Result<Vec<StepOutcome>, ExecutorError> {
-    ensure_log_file(log_path)?;
+    let log = BuildLog::open_append(log_path).map_err(ExecutorError::LogWriteFailed)?;
     let mut results = Vec::with_capacity(steps.len());
     let build_deadline = match timeout_seconds {
         Some(seconds) => Some(
@@ -226,9 +215,16 @@ pub fn execute_pipeline(
         None => None,
     };
 
-    for step in steps {
-        let step_log = log_path.to_path_buf();
-        append_line(&step_log, &format!("[step] {}", step.name))?;
+    for (index, step) in steps.iter().enumerate() {
+        let step_index =
+            u32::try_from(index).map_err(|err| ExecutorError::LogWriteFailed(err.to_string()))?;
+        log.append(
+            Some(step_index),
+            LogStream::Build,
+            format!("[step] {}\n", step.name).as_bytes(),
+        )
+        .map_err(ExecutorError::LogWriteFailed)?;
+        log.sync().map_err(ExecutorError::LogWriteFailed)?;
         let step_timeout = step
             .timeout_minutes
             .map(|minutes| minutes.saturating_mul(60));
@@ -240,23 +236,36 @@ pub fn execute_pipeline(
                 .as_secs()
                 .saturating_add(u64::from(remaining.subsec_nanos() > 0))
         });
-        if build_time_remaining == Some(0) {
-            results.push(StepOutcome {
+        let outcome = if build_time_remaining == Some(0) {
+            StepOutcome {
                 name: step.name.clone(),
                 command: step.run.clone(),
                 status: StepStatus::TimedOut,
                 exit_code: None,
                 log_path: log_path.to_path_buf(),
-            });
-            break;
-        }
-        let timeout = match (step_timeout, build_time_remaining) {
-            (Some(step), Some(build)) => Some(step.min(build)),
-            (Some(step), None) => Some(step),
-            (None, Some(build)) => Some(build),
-            (None, None) => None,
+            }
+        } else {
+            let timeout = match (step_timeout, build_time_remaining) {
+                (Some(step), Some(build)) => Some(step.min(build)),
+                (Some(step), None) => Some(step),
+                (None, Some(build)) => Some(build),
+                (None, None) => None,
+            };
+            run_step_with_log(step, workspace, log_path, &log, step_index, timeout)?
         };
-        let outcome = run_step(step, workspace, &step_log, timeout)?;
+        let status = match outcome.status {
+            StepStatus::Succeeded => "succeeded",
+            StepStatus::Failed => "failed",
+            StepStatus::TimedOut => "timed_out",
+            StepStatus::Cancelled => "cancelled",
+        };
+        log.append(
+            Some(step_index),
+            LogStream::Build,
+            format!("[step] {status}\n").as_bytes(),
+        )
+        .map_err(ExecutorError::LogWriteFailed)?;
+        log.sync().map_err(ExecutorError::LogWriteFailed)?;
         results.push(outcome);
         if matches!(
             results.last().unwrap().status,
@@ -308,7 +317,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
         let working_directory = workspace.join("nested");
-        fs::create_dir(&working_directory).unwrap();
+        std::fs::create_dir(&working_directory).unwrap();
         let log_path = workspace.join("configured.log");
         let step = StepConfig {
             name: "configured".to_string(),
@@ -322,7 +331,7 @@ mod tests {
 
         assert_eq!(outcome.status, StepStatus::Succeeded);
         assert_eq!(
-            fs::read_to_string(working_directory.join("output.txt")).unwrap(),
+            std::fs::read_to_string(working_directory.join("output.txt")).unwrap(),
             "present"
         );
     }

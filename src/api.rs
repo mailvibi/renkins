@@ -34,13 +34,6 @@ pub struct BuildResponse {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BuildLogResponse {
-    pub build_id: String,
-    pub entries: Vec<String>,
-    pub log_integrity: String,
-}
-
 pub fn validate_name(name: &str) -> Result<(), ApiError> {
     if name.trim().is_empty() || name.len() > 128 {
         return Err(ApiError {
@@ -106,21 +99,6 @@ pub fn enqueue_build(request: &BuildEnqueueRequest) -> Result<BuildResponse, Api
     })
 }
 
-pub fn build_logs(build_id: &str) -> Result<BuildLogResponse, ApiError> {
-    if build_id.trim().is_empty() {
-        return Err(ApiError {
-            code: "invalid_build_id",
-            message: "build_id is required".to_string(),
-        });
-    }
-
-    Ok(BuildLogResponse {
-        build_id: build_id.to_string(),
-        entries: vec!["[step] bootstrap".to_string()],
-        log_integrity: "valid".to_string(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,14 +143,10 @@ mod tests {
     }
 
     #[test]
-    fn buildenqueue_and_logs_paths_succeed_for_valid_requests() {
+    fn build_enqueue_accepts_fully_qualified_refs() {
         let build = enqueue_build(&BuildEnqueueRequest {
             ref_name: Some("refs/heads/main".to_string()),
         });
         assert!(build.is_ok());
-
-        let logs = build_logs("build-1");
-        assert!(logs.is_ok());
-        assert_eq!(logs.unwrap().log_integrity, "valid");
     }
 }

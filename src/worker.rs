@@ -1,10 +1,10 @@
 use crate::domain::{Build, BuildStatus};
 use crate::executor::{self, StepStatus};
 use crate::git;
+use crate::logs::{BuildLog, LogStream};
 use crate::pipeline::parse_pipeline_yaml;
 use crate::storage::DatabaseStore;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -63,7 +63,7 @@ fn process_build(
         })?
     };
 
-    let log_path = data_dir.join("logs").join(format!("{}.log", build.id));
+    let log_path = data_dir.join("logs").join(format!("{}.rkl", build.id));
     if let Some(parent) = log_path.parent()
         && let Err(err) = fs::create_dir_all(parent)
     {
@@ -312,14 +312,9 @@ fn fail_build(
 }
 
 fn append_log(path: &Path, message: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| format!("failed to open build log {}: {err}", path.display()))?;
-    writeln!(file, "{message}")
-        .and_then(|()| file.flush())
-        .map_err(|err| format!("failed to append build log {}: {err}", path.display()))
+    let log = BuildLog::open_append(path)?;
+    log.append(None, LogStream::Build, format!("{message}\n").as_bytes())?;
+    log.sync()
 }
 
 #[cfg(test)]
@@ -379,7 +374,7 @@ mod tests {
 version: 1
 steps:
   - name: create-marker
-    run: printf done > marker.txt
+    run: printf done; printf done > marker.txt
 "#;
         let (dir, store) = fixture(pipeline);
 
@@ -406,6 +401,17 @@ steps:
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].status, "succeeded");
         assert!(steps[0].exit_code.is_some());
+        let log_page =
+            crate::logs::read_page(&dir.path().join("logs/build-1.rkl"), None, 100, true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(log_page.integrity, "valid");
+        assert!(
+            log_page
+                .records
+                .iter()
+                .any(|record| record.stream == "stdout" && record.payload == b"done")
+        );
     }
 
     #[test]

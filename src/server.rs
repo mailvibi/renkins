@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -15,12 +15,14 @@ use crate::api::{
 };
 use crate::config::{ServerConfig, read_or_create_token_file, validate_token_header};
 use crate::domain::{Build, BuildStatus, Job};
+use crate::logs::{ReadLogError, read_page};
 use crate::storage::{DatabaseStore, EnqueueBuildError};
 
 #[derive(Clone, Debug)]
 pub struct AppState {
     token: String,
     store: Arc<Mutex<DatabaseStore>>,
+    logs_dir: PathBuf,
 }
 
 pub fn build_router(expected_token: &str) -> Result<Router, String> {
@@ -30,12 +32,19 @@ pub fn build_router(expected_token: &str) -> Result<Router, String> {
 }
 
 pub fn build_router_with_store(expected_token: &str, store: DatabaseStore) -> Router {
-    build_router_with_shared_store(expected_token, Arc::new(Mutex::new(store)))
+    let logs_dir = store
+        .path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("logs");
+    build_router_with_shared_store(expected_token, Arc::new(Mutex::new(store)), logs_dir)
 }
 
 fn build_router_with_shared_store(
     expected_token: &str,
     store: Arc<Mutex<DatabaseStore>>,
+    logs_dir: PathBuf,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthcheck))
@@ -50,9 +59,11 @@ fn build_router_with_shared_store(
             get(list_builds_route).post(enqueue_build_route),
         )
         .route("/api/v1/builds/{build_id}", get(get_build_route))
+        .route("/api/v1/builds/{build_id}/logs", get(get_build_logs_route))
         .with_state(AppState {
             token: expected_token.to_string(),
             store,
+            logs_dir,
         })
 }
 
@@ -69,7 +80,8 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
         Arc::clone(&store),
         Path::new(&config.data_dir).to_path_buf(),
     )?;
-    let router = build_router_with_shared_store(&token, store);
+    let router =
+        build_router_with_shared_store(&token, store, Path::new(&config.data_dir).join("logs"));
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .map_err(|err| format!("failed to bind {}: {err}", config.listen))?;
@@ -249,6 +261,118 @@ async fn get_build_route(
         "status": build_status(build.status),
         "pipeline": snapshot,
         "steps": steps
+    }))
+    .into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LogParams {
+    cursor: Option<String>,
+    #[serde(default = "default_log_limit")]
+    limit: usize,
+}
+
+fn default_log_limit() -> usize {
+    100
+}
+
+async fn get_build_logs_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(build_id): AxumPath<String>,
+    Query(params): Query<LogParams>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&state, &headers) {
+        return Err(unauthorized_response());
+    }
+    if params.limit == 0 || params.limit > 100 {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "invalid_log_limit",
+                "message": "limit must be between 1 and 100"
+            })),
+        )
+            .into_response());
+    }
+
+    let build = state
+        .store
+        .lock()
+        .map_err(|_| internal_error_response())?
+        .get_build(&build_id)
+        .map_err(|_| internal_error_response())?;
+    let Some(build) = build else {
+        return Ok(not_found_response(
+            "build_not_found",
+            "build does not exist",
+        ));
+    };
+    let terminal = matches!(
+        build.status,
+        BuildStatus::Succeeded
+            | BuildStatus::Failed
+            | BuildStatus::Cancelled
+            | BuildStatus::Interrupted
+    );
+    let log_path = state.logs_dir.join(format!("{}.rkl", build.id));
+    if terminal && !log_path.exists() {
+        return Ok((
+            StatusCode::GONE,
+            Json(json!({
+                "code": "log_expired",
+                "message": "build log is no longer available"
+            })),
+        )
+            .into_response());
+    }
+    let page = match read_page(&log_path, params.cursor.as_deref(), params.limit, terminal) {
+        Ok(Some(page)) => page,
+        Ok(None) if terminal => {
+            return Ok((
+                StatusCode::GONE,
+                Json(json!({
+                    "code": "log_expired",
+                    "message": "build log is no longer available"
+                })),
+            )
+                .into_response());
+        }
+        Ok(None) => {
+            return Ok(Json(json!({
+                "build_id": build.id,
+                "records": [],
+                "next_cursor": params.cursor.unwrap_or_else(|| "0000000000000000".to_string()),
+                "has_more": false,
+                "log_integrity": "valid"
+            }))
+            .into_response());
+        }
+        Err(ReadLogError::InvalidCursor) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": "invalid_log_cursor",
+                    "message": "cursor must identify a complete log record boundary"
+                })),
+            )
+                .into_response());
+        }
+        Err(ReadLogError::Io(_)) => return Err(internal_error_response()),
+    };
+
+    Ok(Json(json!({
+        "build_id": build.id,
+        "records": page.records.iter().map(|record| json!({
+            "timestamp_ms": record.timestamp_ms,
+            "step_index": record.step_index,
+            "stream": record.stream,
+            "payload_base64": crate::logs::encode_base64(&record.payload)
+        })).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+        "log_integrity": page.integrity,
+        "warning": page.warning
     }))
     .into_response())
 }
@@ -679,5 +803,116 @@ mod tests {
         assert_eq!(builds.len(), 1);
         assert_eq!(builds[0].status, crate::domain::BuildStatus::Queued);
         assert_eq!(builds[0].requested_ref, "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn build_logs_are_authenticated_paginated_and_report_expiry() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("renkins.sqlite3");
+        let mut store = DatabaseStore::open(&db_path).unwrap();
+        store.initialize_schema().unwrap();
+        store
+            .create_job(&Job {
+                id: "job-1".to_string(),
+                name: "logs".to_string(),
+                repository_url: "https://example.com/repo.git".to_string(),
+                default_ref: None,
+                disabled: false,
+            })
+            .unwrap();
+        store
+            .enqueue_build("build-1", "job-1", "refs/heads/main")
+            .unwrap();
+        let app = build_router_with_store("secret-token", store);
+
+        let missing_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/build-1/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
+
+        let log_path = dir.path().join("logs/build-1.rkl");
+        let log = crate::logs::BuildLog::open_append(&log_path).unwrap();
+        log.append(Some(0), crate::logs::LogStream::Stdout, &[b'h', b'i', 0xff])
+            .unwrap();
+        log.sync().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/build-1/logs?limit=1")
+                    .header("Authorization", concat!("Bearer ", "secret-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["records"][0]["payload_base64"], "aGn/");
+        assert_eq!(page["records"][0]["stream"], "stdout");
+        assert_eq!(page["records"][0]["step_index"], 0);
+        assert_eq!(page["log_integrity"], "valid");
+
+        let mut log_bytes = std::fs::read(&log_path).unwrap();
+        let last_byte = log_bytes.len() - 1;
+        log_bytes[last_byte] ^= 0xff;
+        std::fs::write(&log_path, log_bytes).unwrap();
+        let corrupt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/build-1/logs")
+                    .header("Authorization", concat!("Bearer ", "secret-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(corrupt.status(), StatusCode::OK);
+        let body = to_bytes(corrupt.into_body(), 64 * 1024).await.unwrap();
+        let corrupt_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(corrupt_json["log_integrity"], "corrupt");
+        assert_eq!(corrupt_json["warning"], "log_corrupt");
+
+        let invalid_cursor = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/build-1/logs?cursor=0000000000000001")
+                    .header("Authorization", concat!("Bearer ", "secret-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+
+        let expired_store = DatabaseStore::open(&db_path).unwrap();
+        expired_store
+            .transition_build("build-1", BuildStatus::Queued, BuildStatus::Cancelled)
+            .unwrap();
+        std::fs::remove_file(log_path).unwrap();
+        drop(app);
+        let app = build_router_with_store("secret-token", expired_store);
+        let expired = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/build-1/logs?cursor=0000000000000001")
+                    .header("Authorization", concat!("Bearer ", "secret-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::GONE);
     }
 }

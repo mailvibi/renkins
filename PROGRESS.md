@@ -2,6 +2,16 @@
 
 ## Current handoff
 
+The log-format and retrieval slice is now implemented:
+
+- Build output is written as versioned length-prefixed records containing timestamp, optional step index, stream, payload length, CRC-32 checksum, and up to 8 KiB of raw payload.
+- Stdout and stderr are drained concurrently into records; a shared per-build writer lock prevents frames from interleaving. Records flush on write and sync at least once per second and at step/build transitions.
+- Added authenticated `GET /api/v1/builds/{build_id}/logs` with an opaque frame-boundary cursor, record limit (1-100), base64 payloads, and a bounded 32 KiB raw-payload page.
+- Reader validates all frames, returns only complete-record cursors, reports interior corruption as `log_integrity=corrupt` with `log_corrupt`, and truncates incomplete tails only for terminal builds with `log_integrity=recovered_tail`. Missing logs for terminal builds return `410 log_expired`.
+- Removed the previous placeholder API helper that returned fabricated log entries.
+- API integration tests cover bearer authentication, binary output, invalid cursors, corrupt logs, and expired logs. Worker tests confirm executor output uses the framed format.
+- Validation passed: `cargo test --all-targets` (53 tests), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`, and `git diff --check`.
+
 The durable worker execution slice is now implemented:
 
 - Server startup launches one polling worker sharing the SQLite store with the API. Claims and metadata operations hold the store lock only for storage calls; checkout and shell execution run without holding it.
@@ -38,10 +48,10 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-The worker is currently a single polling loop with no configured concurrency or graceful shutdown. The HTTP API does not yet provide cancellation or log retrieval; although logs are written to per-build files, there is no bounded read/tail API or structured record format. Build-level API timing is also incomplete. Readiness does not reflect worker state. Next roadmap slice: persist and expose richer build/step timing and log metadata, then implement cancellation and bounded log retrieval. Follow with configurable worker concurrency and graceful shutdown, scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Continue comparing implementation with [PLAN.md](./PLAN.md) and verify acceptance criteria before declaring a phase complete.
+The worker is currently a single polling loop with no configured concurrency or graceful shutdown. Cancellation is not yet implemented. Build detail still omits build timing metadata, and step timing is incomplete. Readiness does not reflect worker state. Next roadmap slice: cancellation through process-group signaling and transactional state changes, followed by build/step timing exposure, configurable worker concurrency and graceful shutdown, scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement also remain outstanding.
 
 ## Continuation and commits
 
 - Keep the main branch compiling and tested after each logical implementation step.
 - Commit each independently completed implementation step with its tests and directly related documentation.
-- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 5. Server startup invokes persisted recovery; job/build APIs and the single worker use SQLite. This remains partial coverage of Phase 6, not completion of the scheduler.
+- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 5. Server startup invokes persisted recovery; job/build APIs and the single worker use SQLite, while framed logs are stored on the filesystem. This remains partial coverage of Phase 6, not completion of the scheduler.
