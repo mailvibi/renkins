@@ -2,6 +2,7 @@ use crate::logs::{BuildLog, LogStream, MAX_RECORD_PAYLOAD};
 use crate::pipeline::StepConfig;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{io, os::unix::process::CommandExt};
@@ -65,7 +66,16 @@ pub fn run_step(
     timeout_seconds: Option<u64>,
 ) -> Result<StepOutcome, ExecutorError> {
     let log = BuildLog::open_append(log_path).map_err(ExecutorError::LogWriteFailed)?;
-    run_step_with_log(step, workspace, log_path, &log, 0, timeout_seconds)
+    let cancellation_requested = AtomicBool::new(false);
+    run_step_with_log(
+        step,
+        workspace,
+        log_path,
+        &log,
+        0,
+        timeout_seconds,
+        &cancellation_requested,
+    )
 }
 
 fn run_step_with_log(
@@ -75,6 +85,7 @@ fn run_step_with_log(
     log: &BuildLog,
     step_index: u32,
     timeout_seconds: Option<u64>,
+    cancellation_requested: &AtomicBool,
 ) -> Result<StepOutcome, ExecutorError> {
     let deadline = match timeout_seconds {
         Some(seconds) => Some(
@@ -84,6 +95,9 @@ fn run_step_with_log(
         ),
         None => None,
     };
+    if cancellation_requested.load(Ordering::Acquire) {
+        return Ok(step_outcome(step, log_path, StepStatus::Cancelled, None));
+    }
     let mut command = Command::new("/bin/sh");
     command
         .current_dir(
@@ -117,32 +131,35 @@ fn run_step_with_log(
                 terminate_process_group(process_group)?;
                 join_streams(stdout_thread, stderr_thread)?;
                 let code = status.code().unwrap_or(-1);
-                return Ok(StepOutcome {
-                    name: step.name.clone(),
-                    command: step.run.clone(),
-                    status: if status.success() {
+                return Ok(step_outcome(
+                    step,
+                    log_path,
+                    if cancellation_requested.load(Ordering::Acquire) {
+                        StepStatus::Cancelled
+                    } else if status.success() {
                         StepStatus::Succeeded
                     } else {
                         StepStatus::Failed
                     },
-                    exit_code: Some(code),
-                    log_path: log_path.to_path_buf(),
-                });
+                    Some(code),
+                ));
             }
             Ok(None) => {
+                if cancellation_requested.load(Ordering::Acquire) {
+                    terminate_process_group(process_group)?;
+                    child
+                        .wait()
+                        .map_err(|err| ExecutorError::SpawnFailed(err.to_string()))?;
+                    join_streams(stdout_thread, stderr_thread)?;
+                    return Ok(step_outcome(step, log_path, StepStatus::Cancelled, None));
+                }
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     terminate_process_group(process_group)?;
                     child
                         .wait()
                         .map_err(|err| ExecutorError::SpawnFailed(err.to_string()))?;
                     join_streams(stdout_thread, stderr_thread)?;
-                    return Ok(StepOutcome {
-                        name: step.name.clone(),
-                        command: step.run.clone(),
-                        status: StepStatus::TimedOut,
-                        exit_code: None,
-                        log_path: log_path.to_path_buf(),
-                    });
+                    return Ok(step_outcome(step, log_path, StepStatus::TimedOut, None));
                 }
                 thread::sleep(Duration::from_millis(20));
             }
@@ -155,6 +172,21 @@ fn run_step_with_log(
                 return Err(ExecutorError::SpawnFailed(err.to_string()));
             }
         }
+    }
+}
+
+fn step_outcome(
+    step: &StepConfig,
+    log_path: &Path,
+    status: StepStatus,
+    exit_code: Option<i32>,
+) -> StepOutcome {
+    StepOutcome {
+        name: step.name.clone(),
+        command: step.run.clone(),
+        status,
+        exit_code,
+        log_path: log_path.to_path_buf(),
     }
 }
 
@@ -204,6 +236,23 @@ pub fn execute_pipeline(
     log_path: &Path,
     timeout_seconds: Option<u64>,
 ) -> Result<Vec<StepOutcome>, ExecutorError> {
+    let cancellation_requested = AtomicBool::new(false);
+    execute_pipeline_with_cancellation(
+        workspace,
+        steps,
+        log_path,
+        timeout_seconds,
+        &cancellation_requested,
+    )
+}
+
+pub fn execute_pipeline_with_cancellation(
+    workspace: &Path,
+    steps: &[StepConfig],
+    log_path: &Path,
+    timeout_seconds: Option<u64>,
+    cancellation_requested: &AtomicBool,
+) -> Result<Vec<StepOutcome>, ExecutorError> {
     let log = BuildLog::open_append(log_path).map_err(ExecutorError::LogWriteFailed)?;
     let mut results = Vec::with_capacity(steps.len());
     let build_deadline = match timeout_seconds {
@@ -236,14 +285,10 @@ pub fn execute_pipeline(
                 .as_secs()
                 .saturating_add(u64::from(remaining.subsec_nanos() > 0))
         });
-        let outcome = if build_time_remaining == Some(0) {
-            StepOutcome {
-                name: step.name.clone(),
-                command: step.run.clone(),
-                status: StepStatus::TimedOut,
-                exit_code: None,
-                log_path: log_path.to_path_buf(),
-            }
+        let outcome = if cancellation_requested.load(Ordering::Acquire) {
+            step_outcome(step, log_path, StepStatus::Cancelled, None)
+        } else if build_time_remaining == Some(0) {
+            step_outcome(step, log_path, StepStatus::TimedOut, None)
         } else {
             let timeout = match (step_timeout, build_time_remaining) {
                 (Some(step), Some(build)) => Some(step.min(build)),
@@ -251,7 +296,15 @@ pub fn execute_pipeline(
                 (None, Some(build)) => Some(build),
                 (None, None) => None,
             };
-            run_step_with_log(step, workspace, log_path, &log, step_index, timeout)?
+            run_step_with_log(
+                step,
+                workspace,
+                log_path,
+                &log,
+                step_index,
+                timeout,
+                cancellation_requested,
+            )?
         };
         let status = match outcome.status {
             StepStatus::Succeeded => "succeeded",
@@ -269,7 +322,7 @@ pub fn execute_pipeline(
         results.push(outcome);
         if matches!(
             results.last().unwrap().status,
-            StepStatus::Failed | StepStatus::TimedOut
+            StepStatus::Failed | StepStatus::TimedOut | StepStatus::Cancelled
         ) {
             break;
         }
@@ -281,6 +334,8 @@ pub fn execute_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
 
     #[test]
@@ -376,6 +431,48 @@ mod tests {
         let outcome = run_step(&step, workspace, &log_path, Some(1)).unwrap();
         assert!(matches!(outcome.status, StepStatus::TimedOut));
         assert_eq!(outcome.exit_code, None);
+    }
+
+    #[test]
+    fn cancellation_terminates_the_step_process_group() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("cancelled-step-survived");
+        let step = StepConfig {
+            name: "cancel".to_string(),
+            run: format!(
+                "(sleep 0.7; echo unexpected > '{}') & sleep 10",
+                marker.display()
+            ),
+            working_directory: None,
+            timeout_minutes: None,
+            env: Default::default(),
+        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_signal = Arc::clone(&cancellation);
+        let signal_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            cancellation_signal.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        let log_path = dir.path().join("cancel.log");
+        let log = BuildLog::open_append(&log_path).unwrap();
+        let outcome = run_step_with_log(
+            &step,
+            dir.path(),
+            &log_path,
+            &log,
+            0,
+            Some(5),
+            &cancellation,
+        )
+        .unwrap();
+        signal_thread.join().unwrap();
+
+        assert_eq!(outcome.status, StepStatus::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(800));
+        assert!(!marker.exists());
     }
 
     #[test]

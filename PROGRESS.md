@@ -1,5 +1,15 @@
 # Development Progress
 
+## Latest handoff: build cancellation
+
+Build cancellation is now implemented across the API, worker, Git operations, and shell executor:
+
+- Added authenticated `POST /api/v1/builds/{build_id}/cancel`. Queued builds are cancelled immediately; repeated requests are idempotent; unknown build IDs return 404.
+- Cancellation requests transition active builds to `cancelling` transactionally. The worker then finalizes them as `cancelled` and persists cancelled step outcomes.
+- Active Git commands and shell steps poll a shared cancellation flag. Cancellation terminates their process groups, reaps the direct child, and joins output readers.
+- Added API, worker, executor, and Git process-group cancellation coverage.
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (57 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+
 ## Current handoff
 
 The log-format and retrieval slice is now implemented:
@@ -48,7 +58,7 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-The worker is currently a single polling loop with no configured concurrency or graceful shutdown. Cancellation is not yet implemented. Build detail still omits build timing metadata, and step timing is incomplete. Readiness does not reflect worker state. Next roadmap slice: cancellation through process-group signaling and transactional state changes, followed by build/step timing exposure, configurable worker concurrency and graceful shutdown, scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement also remain outstanding.
+The worker is currently a single polling loop with no configured concurrency or graceful shutdown. Build detail still omits build timing metadata, and step timing is incomplete. Readiness does not reflect worker state. Next roadmap slice: build/step timing exposure, configurable worker concurrency and graceful shutdown, scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement also remain outstanding.
 
 ## Continuation and commits
 

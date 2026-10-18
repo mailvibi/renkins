@@ -4,20 +4,82 @@ use crate::git;
 use crate::logs::{BuildLog, LogStream};
 use crate::pipeline::parse_pipeline_yaml;
 use crate::storage::DatabaseStore;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-pub fn start_worker(store: Arc<Mutex<DatabaseStore>>, data_dir: PathBuf) -> Result<(), String> {
+#[derive(Clone, Debug, Default)]
+pub struct WorkerControl {
+    active_builds: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+}
+
+impl WorkerControl {
+    pub fn cancel_active(&self, build_id: &str) -> Result<bool, String> {
+        let active_builds = self
+            .active_builds
+            .lock()
+            .map_err(|_| "worker control lock is poisoned".to_string())?;
+        if let Some(cancellation_requested) = active_builds.get(build_id) {
+            cancellation_requested.store(true, Ordering::Release);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn register(&self, build_id: &str) -> Result<ActiveBuildGuard, String> {
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let mut active_builds = self
+            .active_builds
+            .lock()
+            .map_err(|_| "worker control lock is poisoned".to_string())?;
+        match active_builds.entry(build_id.to_string()) {
+            Entry::Occupied(_) => {
+                return Err(format!("build {build_id} is already registered as active"));
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&cancellation_requested));
+            }
+        }
+        Ok(ActiveBuildGuard {
+            build_id: build_id.to_string(),
+            cancellation_requested,
+            control: self.clone(),
+        })
+    }
+}
+
+struct ActiveBuildGuard {
+    build_id: String,
+    cancellation_requested: Arc<AtomicBool>,
+    control: WorkerControl,
+}
+
+impl Drop for ActiveBuildGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active_builds) = self.control.active_builds.lock() {
+            active_builds.remove(&self.build_id);
+        }
+    }
+}
+
+pub fn start_worker(
+    store: Arc<Mutex<DatabaseStore>>,
+    data_dir: PathBuf,
+    control: WorkerControl,
+) -> Result<(), String> {
     thread::Builder::new()
         .name("renkins-worker".to_string())
         .spawn(move || {
             loop {
-                match run_one_build(&store, &data_dir) {
+                match run_one_build_with_control(&store, &data_dir, &control) {
                     Ok(true) => {}
                     Ok(false) => thread::sleep(POLL_INTERVAL),
                     Err(err) => {
@@ -32,6 +94,14 @@ pub fn start_worker(store: Arc<Mutex<DatabaseStore>>, data_dir: PathBuf) -> Resu
 }
 
 pub fn run_one_build(store: &Arc<Mutex<DatabaseStore>>, data_dir: &Path) -> Result<bool, String> {
+    run_one_build_with_control(store, data_dir, &WorkerControl::default())
+}
+
+pub fn run_one_build_with_control(
+    store: &Arc<Mutex<DatabaseStore>>,
+    data_dir: &Path,
+    control: &WorkerControl,
+) -> Result<bool, String> {
     let build = {
         let mut store = store
             .lock()
@@ -42,7 +112,12 @@ pub fn run_one_build(store: &Arc<Mutex<DatabaseStore>>, data_dir: &Path) -> Resu
         return Ok(false);
     };
 
-    process_build(store, data_dir, build)?;
+    let active = control.register(&build.id)?;
+    if cancellation_is_requested(store, &build, &active.cancellation_requested)? {
+        finish_cancelled(store, &build, data_dir)?;
+        return Ok(true);
+    }
+    process_build(store, data_dir, build, &active.cancellation_requested)?;
     Ok(true)
 }
 
@@ -50,6 +125,7 @@ fn process_build(
     store: &Arc<Mutex<DatabaseStore>>,
     data_dir: &Path,
     build: Build,
+    cancellation_requested: &AtomicBool,
 ) -> Result<(), String> {
     let job = {
         let store = store
@@ -87,15 +163,26 @@ fn process_build(
             return Err(format!("failed to create build workspace: {err}"));
         }
     };
-    let checkout =
-        match git::checkout_repository(&job.repository_url, &workspace, &build.requested_ref) {
-            Ok(checkout) => checkout,
-            Err(err) => {
-                fail_build(store, &build, BuildStatus::Preparing, "checkout_failed")?;
-                append_log(&log_path, "[build] checkout failed")?;
-                return Err(format!("checkout failed for build {}: {err:?}", build.id));
-            }
-        };
+    if cancellation_is_requested(store, &build, cancellation_requested)? {
+        return finish_cancelled(store, &build, data_dir);
+    }
+    let checkout_result = git::checkout_repository_with_cancellation(
+        &job.repository_url,
+        &workspace,
+        &build.requested_ref,
+        cancellation_requested,
+    );
+    if cancellation_is_requested(store, &build, cancellation_requested)? {
+        return finish_cancelled(store, &build, data_dir);
+    }
+    let checkout = match checkout_result {
+        Ok(checkout) => checkout,
+        Err(err) => {
+            fail_build(store, &build, BuildStatus::Preparing, "checkout_failed")?;
+            append_log(&log_path, "[build] checkout failed")?;
+            return Err(format!("checkout failed for build {}: {err:?}", build.id));
+        }
+    };
 
     let recorded = store
         .lock()
@@ -152,6 +239,9 @@ fn process_build(
             return Err(format!("invalid pipeline for build {}: {err:?}", build.id));
         }
     };
+    if cancellation_is_requested(store, &build, cancellation_requested)? {
+        return finish_cancelled(store, &build, data_dir);
+    }
 
     let started = store
         .lock()
@@ -175,6 +265,9 @@ fn process_build(
         }
     };
     if !started {
+        if cancellation_is_requested(store, &build, cancellation_requested)? {
+            return finish_cancelled(store, &build, data_dir);
+        }
         return Err(format!(
             "pipeline snapshot was not committed for build {}; refusing to execute steps",
             build.id
@@ -191,11 +284,12 @@ fn process_build(
     let timeout_seconds = pipeline
         .timeout_minutes
         .map(|minutes| minutes.saturating_mul(60));
-    let outcomes = match executor::execute_pipeline(
+    let outcomes = match executor::execute_pipeline_with_cancellation(
         &checkout.workspace,
         &pipeline.steps,
         &log_path,
         timeout_seconds,
+        cancellation_requested,
     ) {
         Ok(outcomes) => outcomes,
         Err(err) => {
@@ -249,6 +343,9 @@ fn process_build(
     let failed = outcomes
         .iter()
         .any(|outcome| matches!(outcome.status, StepStatus::Failed | StepStatus::TimedOut));
+    let cancelled = outcomes
+        .iter()
+        .any(|outcome| outcome.status == StepStatus::Cancelled);
     let (next, failure_kind) = if failed {
         let timed_out = outcomes
             .iter()
@@ -264,20 +361,22 @@ fn process_build(
     } else {
         (BuildStatus::Succeeded, None)
     };
-    let transitioned = store
-        .lock()
-        .map_err(|_| "database store lock is poisoned".to_string())?
-        .transition_build_with_failure(&build.id, BuildStatus::Running, next, failure_kind)?;
-    if !transitioned {
-        return Err(format!(
-            "build {} could not transition to its terminal state",
-            build.id
-        ));
-    }
+    let terminal = finish_execution(
+        store,
+        &build,
+        if cancelled {
+            BuildStatus::Cancelled
+        } else {
+            next
+        },
+        failure_kind,
+    )?;
 
     append_log(
         &log_path,
-        if failed {
+        if terminal == BuildStatus::Cancelled {
+            "[build] cancelled"
+        } else if failed {
             "[build] failed"
         } else {
             "[build] succeeded"
@@ -286,29 +385,120 @@ fn process_build(
     Ok(())
 }
 
+fn cancellation_is_requested(
+    store: &Arc<Mutex<DatabaseStore>>,
+    build: &Build,
+    cancellation_requested: &AtomicBool,
+) -> Result<bool, String> {
+    if cancellation_requested.load(Ordering::Acquire) {
+        return Ok(true);
+    }
+    let status = store
+        .lock()
+        .map_err(|_| "database store lock is poisoned".to_string())?
+        .get_build(&build.id)?
+        .map(|current| current.status);
+    if status == Some(BuildStatus::Cancelling) {
+        cancellation_requested.store(true, Ordering::Release);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn finish_cancelled(
+    store: &Arc<Mutex<DatabaseStore>>,
+    build: &Build,
+    data_dir: &Path,
+) -> Result<(), String> {
+    let terminal = finish_execution(store, build, BuildStatus::Cancelled, None)?;
+    if terminal == BuildStatus::Cancelled {
+        append_log(
+            &data_dir.join("logs").join(format!("{}.rkl", build.id)),
+            "[build] cancelled",
+        )?;
+    }
+    Ok(())
+}
+
+fn finish_execution(
+    store: &Arc<Mutex<DatabaseStore>>,
+    build: &Build,
+    requested_status: BuildStatus,
+    failure_kind: Option<&str>,
+) -> Result<BuildStatus, String> {
+    let store = store
+        .lock()
+        .map_err(|_| "database store lock is poisoned".to_string())?;
+    let current = store
+        .get_build(&build.id)?
+        .ok_or_else(|| format!("build {} disappeared", build.id))?;
+    let (expected, next, failure_kind) = if current.status == BuildStatus::Cancelling {
+        (BuildStatus::Cancelling, BuildStatus::Cancelled, None)
+    } else if current.status == BuildStatus::Running && requested_status != BuildStatus::Cancelled {
+        (BuildStatus::Running, requested_status, failure_kind)
+    } else if current.status == BuildStatus::Running {
+        let cancelling =
+            store.transition_build(&build.id, BuildStatus::Running, BuildStatus::Cancelling)?;
+        if !cancelling {
+            return Err(format!(
+                "build {} could not enter cancelling state",
+                build.id
+            ));
+        }
+        let cancelled =
+            store.transition_build(&build.id, BuildStatus::Cancelling, BuildStatus::Cancelled)?;
+        if !cancelled {
+            return Err(format!(
+                "build {} could not enter cancelled state",
+                build.id
+            ));
+        }
+        return Ok(BuildStatus::Cancelled);
+    } else {
+        return Ok(current.status);
+    };
+    let transitioned =
+        store.transition_build_with_failure(&build.id, expected, next, failure_kind)?;
+    if !transitioned {
+        return Err(format!(
+            "build {} could not transition from {expected:?} to {next:?}",
+            build.id
+        ));
+    }
+    Ok(next)
+}
+
 fn fail_build(
     store: &Arc<Mutex<DatabaseStore>>,
     build: &Build,
     expected: BuildStatus,
     failure_kind: &str,
 ) -> Result<(), String> {
-    let transitioned = store
+    let store = store
         .lock()
-        .map_err(|_| "database store lock is poisoned".to_string())?
-        .transition_build_with_failure(
-            &build.id,
-            expected,
-            BuildStatus::Failed,
-            Some(failure_kind),
-        )?;
-    if transitioned {
-        Ok(())
-    } else {
-        Err(format!(
-            "build {} could not be marked failed after {failure_kind}",
-            build.id
-        ))
+        .map_err(|_| "database store lock is poisoned".to_string())?;
+    let current = store
+        .get_build(&build.id)?
+        .ok_or_else(|| format!("build {} disappeared", build.id))?;
+    if current.status == BuildStatus::Cancelling {
+        return store
+            .transition_build(&build.id, BuildStatus::Cancelling, BuildStatus::Cancelled)
+            .and_then(|transitioned| {
+                transitioned
+                    .then_some(())
+                    .ok_or_else(|| format!("build {} could not be cancelled", build.id))
+            });
     }
+    let transitioned = store.transition_build_with_failure(
+        &build.id,
+        expected,
+        BuildStatus::Failed,
+        Some(failure_kind),
+    )?;
+    transitioned
+        .then_some(())
+        .ok_or_else(|| format!("build {} could not be marked failed", build.id))
 }
 
 fn append_log(path: &Path, message: &str) -> Result<(), String> {
@@ -323,6 +513,7 @@ mod tests {
     use crate::domain::Job;
     use crate::storage::DatabaseStore;
     use std::process::Command;
+    use std::time::Instant;
     use tempfile::tempdir;
 
     fn git(repository: &Path, args: &[&str]) {
@@ -467,5 +658,48 @@ steps:
                 .join("workspaces/build-1/checkout/marker.txt")
                 .exists()
         );
+    }
+
+    #[test]
+    fn cancellation_request_stops_a_running_pipeline_and_finishes_build() {
+        let pipeline = r#"
+version: 1
+steps:
+  - name: wait
+    run: sleep 10
+"#;
+        let (dir, store) = fixture(pipeline);
+        let control = WorkerControl::default();
+        let worker_store = Arc::clone(&store);
+        let worker_control = control.clone();
+        let data_dir = dir.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            run_one_build_with_control(&worker_store, &data_dir, &worker_control)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let build = store.lock().unwrap().get_build("build-1").unwrap().unwrap();
+            if build.status == BuildStatus::Running {
+                break;
+            }
+            assert!(Instant::now() < deadline, "worker did not start the build");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let cancellation = store
+            .lock()
+            .unwrap()
+            .request_build_cancellation("build-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancellation.status, BuildStatus::Cancelling);
+        assert!(control.cancel_active("build-1").unwrap());
+        assert!(worker.join().unwrap().unwrap());
+
+        let build = store.lock().unwrap().get_build("build-1").unwrap().unwrap();
+        assert_eq!(build.status, BuildStatus::Cancelled);
+        let steps = store.lock().unwrap().get_build_steps("build-1").unwrap();
+        assert_eq!(steps[0].status, "cancelled");
     }
 }

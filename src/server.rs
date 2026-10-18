@@ -17,12 +17,14 @@ use crate::config::{ServerConfig, read_or_create_token_file, validate_token_head
 use crate::domain::{Build, BuildStatus, Job};
 use crate::logs::{ReadLogError, read_page};
 use crate::storage::{DatabaseStore, EnqueueBuildError};
+use crate::worker::WorkerControl;
 
 #[derive(Clone, Debug)]
 pub struct AppState {
     token: String,
     store: Arc<Mutex<DatabaseStore>>,
     logs_dir: PathBuf,
+    worker_control: WorkerControl,
 }
 
 pub fn build_router(expected_token: &str) -> Result<Router, String> {
@@ -38,13 +40,19 @@ pub fn build_router_with_store(expected_token: &str, store: DatabaseStore) -> Ro
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .join("logs");
-    build_router_with_shared_store(expected_token, Arc::new(Mutex::new(store)), logs_dir)
+    build_router_with_shared_store(
+        expected_token,
+        Arc::new(Mutex::new(store)),
+        logs_dir,
+        WorkerControl::default(),
+    )
 }
 
 fn build_router_with_shared_store(
     expected_token: &str,
     store: Arc<Mutex<DatabaseStore>>,
     logs_dir: PathBuf,
+    worker_control: WorkerControl,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthcheck))
@@ -59,11 +67,13 @@ fn build_router_with_shared_store(
             get(list_builds_route).post(enqueue_build_route),
         )
         .route("/api/v1/builds/{build_id}", get(get_build_route))
+        .route("/api/v1/builds/{build_id}/cancel", post(cancel_build_route))
         .route("/api/v1/builds/{build_id}/logs", get(get_build_logs_route))
         .with_state(AppState {
             token: expected_token.to_string(),
             store,
             logs_dir,
+            worker_control,
         })
 }
 
@@ -76,12 +86,18 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
     store.initialize_schema()?;
     store.recover_abandoned_builds()?;
     let store = Arc::new(Mutex::new(store));
+    let worker_control = WorkerControl::default();
     crate::worker::start_worker(
         Arc::clone(&store),
         Path::new(&config.data_dir).to_path_buf(),
+        worker_control.clone(),
     )?;
-    let router =
-        build_router_with_shared_store(&token, store, Path::new(&config.data_dir).join("logs"));
+    let router = build_router_with_shared_store(
+        &token,
+        store,
+        Path::new(&config.data_dir).join("logs"),
+        worker_control,
+    );
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .map_err(|err| format!("failed to bind {}: {err}", config.listen))?;
@@ -261,6 +277,41 @@ async fn get_build_route(
         "status": build_status(build.status),
         "pipeline": snapshot,
         "steps": steps
+    }))
+    .into_response())
+}
+
+async fn cancel_build_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(build_id): AxumPath<String>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&state, &headers) {
+        return Err(unauthorized_response());
+    }
+    let build = state
+        .store
+        .lock()
+        .map_err(|_| internal_error_response())?
+        .request_build_cancellation(&build_id)
+        .map_err(|_| internal_error_response())?;
+    let Some(build) = build else {
+        return Ok(not_found_response(
+            "build_not_found",
+            "build does not exist",
+        ));
+    };
+    if build.status == BuildStatus::Cancelling {
+        state
+            .worker_control
+            .cancel_active(&build_id)
+            .map_err(|_| internal_error_response())?;
+    }
+    Ok(Json(json!({
+        "id": build.id,
+        "job_id": build.job_id,
+        "number": build.number,
+        "status": build_status(build.status)
     }))
     .into_response())
 }
@@ -914,5 +965,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(expired.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn queued_build_cancellation_is_authenticated_and_idempotent() {
+        let mut store = DatabaseStore::open_in_memory().unwrap();
+        store.initialize_schema().unwrap();
+        store
+            .create_job(&Job {
+                id: "job-1".to_string(),
+                name: "cancel".to_string(),
+                repository_url: "https://example.com/repo.git".to_string(),
+                default_ref: None,
+                disabled: false,
+            })
+            .unwrap();
+        store
+            .enqueue_build("build-1", "job-1", "refs/heads/main")
+            .unwrap();
+        let app = build_router_with_store("secret-token", store);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/build-1/cancel")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/builds/build-1/cancel")
+                        .method("POST")
+                        .header("Authorization", concat!("Bearer ", "secret-token"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["status"], "cancelled");
+        }
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/no-such-build/cancel")
+                    .method("POST")
+                    .header("Authorization", concat!("Bearer ", "secret-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{os::unix::process::CommandExt, process::Output};
@@ -20,6 +21,7 @@ pub enum GitRefError {
     NotACommit,
     CommandFailed(String),
     TimedOut,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,14 @@ pub fn prepare_workspace(data_dir: &Path, build_id: &str) -> Result<PathBuf, std
 }
 
 pub fn resolve_commit(repo_path: &Path, reference: &str) -> Result<String, GitRefError> {
+    resolve_commit_with_cancellation(repo_path, reference, None)
+}
+
+fn resolve_commit_with_cancellation(
+    repo_path: &Path,
+    reference: &str,
+    cancellation_requested: Option<&AtomicBool>,
+) -> Result<String, GitRefError> {
     validate_ref(reference)?;
 
     let mut command = Command::new("git");
@@ -84,7 +94,8 @@ pub fn resolve_commit(repo_path: &Path, reference: &str) -> Result<String, GitRe
         .arg("--quiet")
         .arg(format!("{reference}^{{commit}}"));
     configure_git_environment(&mut command);
-    let output = run_git_command(command, GIT_COMMAND_TIMEOUT)?;
+    let output =
+        run_git_command_with_cancellation(command, GIT_COMMAND_TIMEOUT, cancellation_requested)?;
 
     if !output.status.success() {
         return Err(GitRefError::RefNotFound);
@@ -103,6 +114,24 @@ pub fn checkout_repository(
     workspace: &Path,
     reference: &str,
 ) -> Result<CheckoutResult, GitRefError> {
+    checkout_repository_inner(repo_url, workspace, reference, None)
+}
+
+pub(crate) fn checkout_repository_with_cancellation(
+    repo_url: &str,
+    workspace: &Path,
+    reference: &str,
+    cancellation_requested: &AtomicBool,
+) -> Result<CheckoutResult, GitRefError> {
+    checkout_repository_inner(repo_url, workspace, reference, Some(cancellation_requested))
+}
+
+fn checkout_repository_inner(
+    repo_url: &str,
+    workspace: &Path,
+    reference: &str,
+    cancellation_requested: Option<&AtomicBool>,
+) -> Result<CheckoutResult, GitRefError> {
     validate_ref(reference)?;
 
     if workspace.exists() {
@@ -118,13 +147,14 @@ pub fn checkout_repository(
         .arg(repo_url)
         .arg(workspace);
     configure_git_environment(&mut clone);
-    let output = run_git_command(clone, CLONE_TIMEOUT)?;
+    let output = run_git_command_with_cancellation(clone, CLONE_TIMEOUT, cancellation_requested)?;
 
     if !output.status.success() {
         return Err(command_failure("git clone", &output));
     }
 
-    let resolved_commit = resolve_commit(workspace, reference)?;
+    let resolved_commit =
+        resolve_commit_with_cancellation(workspace, reference, cancellation_requested)?;
 
     let mut checkout = Command::new("git");
     checkout
@@ -132,7 +162,8 @@ pub fn checkout_repository(
         .args(["checkout", "--detach", "--quiet"])
         .arg(&resolved_commit);
     configure_git_environment(&mut checkout);
-    let output = run_git_command(checkout, GIT_COMMAND_TIMEOUT)?;
+    let output =
+        run_git_command_with_cancellation(checkout, GIT_COMMAND_TIMEOUT, cancellation_requested)?;
 
     if !output.status.success() {
         return Err(command_failure("git checkout", &output));
@@ -157,7 +188,11 @@ fn configure_git_environment(command: &mut Command) {
         .process_group(0);
 }
 
-fn run_git_command(mut command: Command, timeout: Duration) -> Result<Output, GitRefError> {
+fn run_git_command_with_cancellation(
+    mut command: Command,
+    timeout: Duration,
+    cancellation_requested: Option<&AtomicBool>,
+) -> Result<Output, GitRefError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
@@ -178,6 +213,12 @@ fn run_git_command(mut command: Command, timeout: Duration) -> Result<Output, Gi
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            Ok(None) if cancellation_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) => {
+                let termination = terminate_process_group(&mut child, process_group);
+                let _ = (join_reader(stdout_reader)?, join_reader(stderr_reader)?);
+                termination?;
+                return Err(GitRefError::Cancelled);
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 let termination = terminate_process_group(&mut child, process_group);
@@ -277,6 +318,7 @@ fn command_failure(operation: &str, output: &Output) -> GitRefError {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -317,9 +359,34 @@ mod tests {
 
         let started = Instant::now();
         assert!(matches!(
-            run_git_command(command, Duration::from_millis(100)),
+            run_git_command_with_cancellation(command, Duration::from_millis(100), None),
             Err(GitRefError::TimedOut)
         ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn git_commands_cancel_and_reap_their_process_group() {
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let cancellation_signal = Arc::clone(&cancellation_requested);
+        let signal_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancellation_signal.store(true, Ordering::Release);
+        });
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 10");
+        configure_git_environment(&mut command);
+
+        let started = Instant::now();
+        assert!(matches!(
+            run_git_command_with_cancellation(
+                command,
+                Duration::from_secs(30),
+                Some(&cancellation_requested)
+            ),
+            Err(GitRefError::Cancelled)
+        ));
+        signal_thread.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
@@ -329,7 +396,8 @@ mod tests {
         command.arg("-c").arg("printf 'failure detail' >&2; exit 7");
         configure_git_environment(&mut command);
 
-        let output = run_git_command(command, Duration::from_secs(1)).unwrap();
+        let output =
+            run_git_command_with_cancellation(command, Duration::from_secs(1), None).unwrap();
         assert_eq!(
             command_failure("git test", &output),
             GitRefError::CommandFailed("git test failed: failure detail".to_string())

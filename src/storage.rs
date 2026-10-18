@@ -220,6 +220,40 @@ impl DatabaseStore {
             .map_err(|err| format!("failed to get build: {err}"))
     }
 
+    pub fn request_build_cancellation(&mut self, id: &str) -> Result<Option<Build>, String> {
+        let now = Self::now_unix_millis()?;
+        let transaction = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| format!("failed to begin build cancellation transaction: {err}"))?;
+        transaction
+            .execute(
+                "UPDATE builds
+                 SET status = CASE status
+                     WHEN 'queued' THEN 'cancelled'
+                     WHEN 'preparing' THEN 'cancelling'
+                     WHEN 'running' THEN 'cancelling'
+                     ELSE status
+                 END,
+                 finished_at = CASE WHEN status = 'queued' THEN ?1 ELSE finished_at END
+                 WHERE id = ?2 AND status IN ('queued', 'preparing', 'running')",
+                params![now, id],
+            )
+            .map_err(|err| format!("failed to request build cancellation: {err}"))?;
+        let build = transaction
+            .query_row(
+                "SELECT id, job_id, number, requested_ref, status FROM builds WHERE id = ?1",
+                [id],
+                Self::build_from_row,
+            )
+            .optional()
+            .map_err(|err| format!("failed to read build after cancellation request: {err}"))?;
+        transaction
+            .commit()
+            .map_err(|err| format!("failed to commit build cancellation: {err}"))?;
+        Ok(build)
+    }
+
     pub fn recover_abandoned_builds(&self) -> Result<usize, String> {
         let now = Self::now_unix_millis()?;
         self.conn
@@ -411,8 +445,8 @@ impl DatabaseStore {
             .map_err(|err| {
                 format!("failed to inspect build before recording step outcomes: {err}")
             })?;
-        if build_status.as_deref() != Some("running") {
-            return Err(format!("build {build_id} is not running"));
+        if !matches!(build_status.as_deref(), Some("running" | "cancelling")) {
+            return Err(format!("build {build_id} is not running or cancelling"));
         }
         for (step_index, status, exit_code) in outcomes {
             if !matches!(*status, "succeeded" | "failed" | "timed_out" | "cancelled") {
