@@ -1,5 +1,11 @@
 # Development Progress
 
+## Latest handoff: startup log recovery and integrity
+
+Startup now scans retained `.rkl` logs after interrupted builds are marked and before readiness or worker startup. Incomplete final records are truncated and synced; interior corruption is preserved and persisted as `corrupt`; recoverable interrupted builds receive a recovery marker after the valid prefix. Marker work is tracked in SQLite so normal restarts do not append duplicates, and the logs API persists integrity changes it detects, including expired logs. Schema version is now 8.
+
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (69 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+
 ## Latest handoff: Git credential boundaries
 
 Repository URLs now accept public HTTPS or `git@host:path` syntax only, rejecting embedded user-info, query strings, fragments, malformed hosts, and empty SSH paths. Git disables system/global configuration and interactive prompts; SSH is forced to use batch mode and strict host-key checking. README guidance covers operator-provisioned read-only SSH identities, pinned `known_hosts`, and the fact that pipeline code shares the service account's key/agent authority and is not sandboxed. `HOME` remains inherited for SSH config and known-hosts lookup.
@@ -96,10 +102,10 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-Next roadmap slice: startup log scanning/recovery markers, persistent integrity state, and output-size enforcement. Additional API/CLI/UI and release-readiness work remains as listed in `PLAN.md`.
+Next roadmap slice: enforce per-build output-size limits with an explicit failure and truncation marker. Additional API/CLI/UI and release-readiness work remains as listed in `PLAN.md`.
 
 ## Continuation and commits
 
 - Keep the main branch compiling and tested after each logical implementation step.
 - Commit each independently completed implementation step with its tests and directly related documentation.
-- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 7. Server startup invokes persisted recovery; job/build APIs and the worker pool use SQLite, while framed logs are stored on the filesystem. This remains partial coverage of Phase 6, not completion of the scheduler.
+- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 8. Server startup invokes persisted build and log recovery; job/build APIs and the worker pool use SQLite, while framed logs are stored on the filesystem. This remains partial coverage of Phase 6, not completion of the scheduler.

@@ -294,6 +294,20 @@ pub fn read_page(
     }))
 }
 
+pub fn recover_log_tail(path: &Path) -> Result<&'static str, ReadLogError> {
+    Ok(read_page(path, None, 1, true)?.map_or("valid", |page| page.integrity))
+}
+
+pub fn append_restart_marker(path: &Path) -> Result<(), String> {
+    let log = BuildLog::open_append(path)?;
+    log.append(
+        None,
+        LogStream::Build,
+        b"[build] interrupted by server restart; valid log prefix recovered",
+    )?;
+    log.sync()
+}
+
 fn parse_cursor(cursor: Option<&str>) -> Result<u64, ReadLogError> {
     match cursor {
         None => Ok(0),

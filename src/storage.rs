@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_job_build_numbers.sql")),
@@ -17,6 +17,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         7,
         include_str!("../migrations/0007_cancellation_reason.sql"),
     ),
+    (8, include_str!("../migrations/0008_log_integrity.sql")),
 ];
 const MAX_PAGE_SIZE: u32 = 100;
 
@@ -308,6 +309,78 @@ impl DatabaseStore {
                 [now],
             )
             .map_err(|err| format!("failed to recover abandoned builds: {err}"))
+    }
+
+    pub fn interrupted_builds_needing_log_marker(&self) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id FROM builds
+                 WHERE status = 'interrupted'
+                   AND failure_kind = 'server_crash'
+                   AND recovery_marker_written = 0
+                   AND log_integrity NOT IN ('corrupt', 'expired')
+                 ORDER BY id",
+            )
+            .map_err(|err| format!("failed to prepare interrupted build marker query: {err}"))?;
+        let rows = statement.query_map([], |row| row.get(0)).map_err(|err| {
+            format!("failed to query interrupted builds needing log markers: {err}")
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("failed to read interrupted build marker rows: {err}"))
+    }
+
+    pub fn mark_recovery_marker_written(&self, build_id: &str) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE builds SET recovery_marker_written = 1
+                 WHERE id = ?1 AND status = 'interrupted' AND failure_kind = 'server_crash'",
+                [build_id],
+            )
+            .map_err(|err| format!("failed to record build recovery marker: {err}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "build {build_id} was not marked as interrupted during log recovery"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn get_log_integrity(&self, build_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT log_integrity FROM builds WHERE id = ?1",
+                [build_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to read build log integrity: {err}"))
+    }
+
+    pub fn set_log_integrity(&self, build_id: &str, integrity: &str) -> Result<(), String> {
+        if !matches!(
+            integrity,
+            "valid" | "recovered_tail" | "corrupt" | "expired"
+        ) {
+            return Err(format!("invalid build log integrity state '{integrity}'"));
+        }
+        self.conn
+            .execute(
+                "UPDATE builds
+                 SET log_integrity = CASE
+                     WHEN log_integrity = 'expired' THEN 'expired'
+                     WHEN ?2 = 'expired' THEN 'expired'
+                     WHEN log_integrity = 'corrupt' THEN 'corrupt'
+                     WHEN ?2 = 'corrupt' THEN 'corrupt'
+                     WHEN log_integrity = 'recovered_tail' AND ?2 = 'valid' THEN 'recovered_tail'
+                     ELSE ?2
+                 END
+                 WHERE id = ?1",
+                params![build_id, integrity],
+            )
+            .map_err(|err| format!("failed to update build log integrity: {err}"))?;
+        Ok(())
     }
 
     pub fn claim_next_build(&mut self) -> Result<Option<Build>, String> {

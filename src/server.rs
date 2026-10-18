@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -94,6 +95,7 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
     let mut store = DatabaseStore::open(&database_path)?;
     store.initialize_schema()?;
     store.recover_abandoned_builds()?;
+    recover_build_logs(&data_dir.join("logs"), &store)?;
     let store = Arc::new(Mutex::new(store));
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -130,6 +132,73 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
         (Ok(()), Err(worker_err)) => Err(format!("worker shutdown failed: {worker_err}")),
         (Err(server_err), Err(worker_err)) => Err(format!(
             "{server_err}; worker shutdown failed: {worker_err}"
+        )),
+    }
+}
+
+fn recover_build_logs(logs_dir: &Path, store: &DatabaseStore) -> Result<(), String> {
+    fs::create_dir_all(logs_dir)
+        .map_err(|err| format!("failed to create build log directory: {err}"))?;
+    let entries = fs::read_dir(logs_dir)
+        .map_err(|err| format!("failed to scan build log directory: {err}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read build log directory: {err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to inspect build log directory entry: {err}"))?;
+        if !file_type.is_file() || entry.path().extension().is_none_or(|ext| ext != "rkl") {
+            continue;
+        }
+        let path = entry.path();
+        let build_id = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("build log has an invalid filename: {}", path.display()))?
+            .to_string();
+        validate_log_build_id(&build_id)?;
+        let integrity = crate::logs::recover_log_tail(&path)
+            .map_err(|err| format!("failed to recover build log {}: {err:?}", path.display()))?;
+        store.set_log_integrity(&build_id, integrity)?;
+    }
+
+    for build_id in store.interrupted_builds_needing_log_marker()? {
+        let path = log_path_for_build(logs_dir, &build_id)?;
+        ensure_safe_log_path(&path)?;
+        crate::logs::append_restart_marker(&path)?;
+        store.mark_recovery_marker_written(&build_id)?;
+    }
+    Ok(())
+}
+
+fn log_path_for_build(logs_dir: &Path, build_id: &str) -> Result<PathBuf, String> {
+    validate_log_build_id(build_id)?;
+    Ok(logs_dir.join(format!("{build_id}.rkl")))
+}
+
+fn validate_log_build_id(build_id: &str) -> Result<(), String> {
+    if build_id.is_empty()
+        || !build_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "build ID cannot be used as a log filename: {build_id:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_safe_log_path(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "build log path is not a regular file: {}",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed to inspect build log path {}: {err}",
+            path.display()
         )),
     }
 }
@@ -462,28 +531,41 @@ async fn get_build_logs_route(
             | BuildStatus::Cancelled
             | BuildStatus::Interrupted
     );
-    let log_path = state.logs_dir.join(format!("{}.rkl", build.id));
-    if terminal && !log_path.exists() {
-        return Ok((
-            StatusCode::GONE,
-            Json(json!({
-                "code": "log_expired",
-                "message": "build log is no longer available"
-            })),
-        )
-            .into_response());
+    let log_path =
+        log_path_for_build(&state.logs_dir, &build.id).map_err(|_| internal_error_response())?;
+    let stored_integrity = state
+        .store
+        .lock()
+        .map_err(|_| internal_error_response())?
+        .get_log_integrity(&build.id)
+        .map_err(|_| internal_error_response())?
+        .unwrap_or_else(|| "valid".to_string());
+    if terminal && stored_integrity == "expired" {
+        return Ok(log_expired_response());
+    }
+    if terminal
+        && !log_path
+            .try_exists()
+            .map_err(|_| internal_error_response())?
+    {
+        state
+            .store
+            .lock()
+            .map_err(|_| internal_error_response())?
+            .set_log_integrity(&build.id, "expired")
+            .map_err(|_| internal_error_response())?;
+        return Ok(log_expired_response());
     }
     let page = match read_page(&log_path, params.cursor.as_deref(), params.limit, terminal) {
         Ok(Some(page)) => page,
         Ok(None) if terminal => {
-            return Ok((
-                StatusCode::GONE,
-                Json(json!({
-                    "code": "log_expired",
-                    "message": "build log is no longer available"
-                })),
-            )
-                .into_response());
+            state
+                .store
+                .lock()
+                .map_err(|_| internal_error_response())?
+                .set_log_integrity(&build.id, "expired")
+                .map_err(|_| internal_error_response())?;
+            return Ok(log_expired_response());
         }
         Ok(None) => {
             return Ok(Json(json!({
@@ -491,7 +573,7 @@ async fn get_build_logs_route(
                 "records": [],
                 "next_cursor": params.cursor.unwrap_or_else(|| "0000000000000000".to_string()),
                 "has_more": false,
-                "log_integrity": "valid"
+                "log_integrity": stored_integrity
             }))
             .into_response());
         }
@@ -508,6 +590,25 @@ async fn get_build_logs_route(
         Err(ReadLogError::Io(_)) => return Err(internal_error_response()),
     };
 
+    let (log_integrity, warning) = {
+        let store = state.store.lock().map_err(|_| internal_error_response())?;
+        if page.integrity != "valid" {
+            store
+                .set_log_integrity(&build.id, page.integrity)
+                .map_err(|_| internal_error_response())?;
+        }
+        let integrity = store
+            .get_log_integrity(&build.id)
+            .map_err(|_| internal_error_response())?
+            .unwrap_or_else(|| page.integrity.to_string());
+        let warning = if integrity == "corrupt" {
+            Some("log_corrupt")
+        } else {
+            page.warning
+        };
+        (integrity, warning)
+    };
+
     Ok(Json(json!({
         "build_id": build.id,
         "records": page.records.iter().map(|record| json!({
@@ -518,10 +619,21 @@ async fn get_build_logs_route(
         })).collect::<Vec<_>>(),
         "next_cursor": page.next_cursor,
         "has_more": page.has_more,
-        "log_integrity": page.integrity,
-        "warning": page.warning
+        "log_integrity": log_integrity,
+        "warning": warning
     }))
     .into_response())
+}
+
+fn log_expired_response() -> Response {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "code": "log_expired",
+            "message": "build log is no longer available"
+        })),
+    )
+        .into_response()
 }
 
 fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -762,6 +874,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use std::io::Write;
     use tempfile::tempdir;
     use tower::ServiceExt;
 
@@ -831,6 +944,90 @@ mod tests {
         let response = app.oneshot(ready_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         worker.shutdown(Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn startup_recovers_log_tails_and_persists_integrity() {
+        let dir = tempdir().unwrap();
+        let logs_dir = dir.path().join("logs");
+        let db_path = dir.path().join("renkins.sqlite3");
+        let mut store = DatabaseStore::open(&db_path).unwrap();
+        store.initialize_schema().unwrap();
+        store
+            .create_job(&crate::domain::Job {
+                id: "job-1".to_string(),
+                name: "recovery".to_string(),
+                repository_url: "https://example.com/repo.git".to_string(),
+                default_ref: None,
+                disabled: false,
+            })
+            .unwrap();
+        store
+            .enqueue_build("build-1", "job-1", "refs/heads/main")
+            .unwrap();
+        store
+            .enqueue_build("build-2", "job-1", "refs/heads/main")
+            .unwrap();
+        store.claim_next_build().unwrap().unwrap();
+        store.claim_next_build().unwrap().unwrap();
+
+        let recovered_path = logs_dir.join("build-1.rkl");
+        let recovered_log = crate::logs::BuildLog::open_append(&recovered_path).unwrap();
+        recovered_log
+            .append(None, crate::logs::LogStream::Build, b"before restart")
+            .unwrap();
+        drop(recovered_log);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&recovered_path)
+            .unwrap()
+            .write_all(&[1, 2])
+            .unwrap();
+
+        let corrupt_path = logs_dir.join("build-2.rkl");
+        let corrupt_log = crate::logs::BuildLog::open_append(&corrupt_path).unwrap();
+        corrupt_log
+            .append(None, crate::logs::LogStream::Build, b"corrupt")
+            .unwrap();
+        drop(corrupt_log);
+        let mut bytes = std::fs::read(&corrupt_path).unwrap();
+        bytes[18] ^= 0xff;
+        std::fs::write(&corrupt_path, bytes).unwrap();
+
+        store.recover_abandoned_builds().unwrap();
+        recover_build_logs(&logs_dir, &store).unwrap();
+
+        assert_eq!(
+            store.get_build("build-1").unwrap().unwrap().status,
+            BuildStatus::Interrupted
+        );
+        assert_eq!(
+            store.get_log_integrity("build-1").unwrap().as_deref(),
+            Some("recovered_tail")
+        );
+        assert_eq!(
+            store.get_log_integrity("build-2").unwrap().as_deref(),
+            Some("corrupt")
+        );
+        let page = crate::logs::read_page(&recovered_path, None, 10, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.records.len(), 2);
+        assert_eq!(
+            page.records[1].payload,
+            b"[build] interrupted by server restart; valid log prefix recovered"
+        );
+
+        let recovered_size = std::fs::metadata(&recovered_path).unwrap().len();
+        recover_build_logs(&logs_dir, &store).unwrap();
+        assert_eq!(
+            std::fs::metadata(&recovered_path).unwrap().len(),
+            recovered_size
+        );
+        assert_eq!(
+            store.get_log_integrity("build-1").unwrap().as_deref(),
+            Some("recovered_tail")
+        );
     }
 
     #[tokio::test]
@@ -1082,6 +1279,14 @@ mod tests {
         let corrupt_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(corrupt_json["log_integrity"], "corrupt");
         assert_eq!(corrupt_json["warning"], "log_corrupt");
+        assert_eq!(
+            DatabaseStore::open(&db_path)
+                .unwrap()
+                .get_log_integrity("build-1")
+                .unwrap()
+                .as_deref(),
+            Some("corrupt")
+        );
 
         let invalid_cursor = app
             .clone()
@@ -1114,6 +1319,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(expired.status(), StatusCode::GONE);
+        assert_eq!(
+            DatabaseStore::open(&db_path)
+                .unwrap()
+                .get_log_integrity("build-1")
+                .unwrap()
+                .as_deref(),
+            Some("expired")
+        );
     }
 
     #[tokio::test]
