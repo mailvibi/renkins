@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{io, os::unix::process::CommandExt};
 
 const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(100);
@@ -24,6 +24,8 @@ pub struct StepOutcome {
     pub status: StepStatus,
     pub exit_code: Option<i32>,
     pub log_path: PathBuf,
+    pub started_at: Option<i64>,
+    pub finished_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +33,7 @@ pub enum ExecutorError {
     SpawnFailed(String),
     InvalidWorkingDirectory,
     InvalidTimeout,
+    ClockError(String),
     LogWriteFailed(String),
     CommandFailed(i32),
     TimedOut,
@@ -96,8 +99,9 @@ fn run_step_with_log(
         None => None,
     };
     if cancellation_requested.load(Ordering::Acquire) {
-        return Ok(step_outcome(step, log_path, StepStatus::Cancelled, None));
+        return step_outcome(step, log_path, StepStatus::Cancelled, None, None);
     }
+    let started_at = timestamp_ms()?;
     let mut command = Command::new("/bin/sh");
     command
         .current_dir(
@@ -131,7 +135,7 @@ fn run_step_with_log(
                 terminate_process_group(process_group)?;
                 join_streams(stdout_thread, stderr_thread)?;
                 let code = status.code().unwrap_or(-1);
-                return Ok(step_outcome(
+                return step_outcome(
                     step,
                     log_path,
                     if cancellation_requested.load(Ordering::Acquire) {
@@ -142,7 +146,8 @@ fn run_step_with_log(
                         StepStatus::Failed
                     },
                     Some(code),
-                ));
+                    Some(started_at),
+                );
             }
             Ok(None) => {
                 if cancellation_requested.load(Ordering::Acquire) {
@@ -151,7 +156,13 @@ fn run_step_with_log(
                         .wait()
                         .map_err(|err| ExecutorError::SpawnFailed(err.to_string()))?;
                     join_streams(stdout_thread, stderr_thread)?;
-                    return Ok(step_outcome(step, log_path, StepStatus::Cancelled, None));
+                    return step_outcome(
+                        step,
+                        log_path,
+                        StepStatus::Cancelled,
+                        None,
+                        Some(started_at),
+                    );
                 }
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     terminate_process_group(process_group)?;
@@ -159,7 +170,13 @@ fn run_step_with_log(
                         .wait()
                         .map_err(|err| ExecutorError::SpawnFailed(err.to_string()))?;
                     join_streams(stdout_thread, stderr_thread)?;
-                    return Ok(step_outcome(step, log_path, StepStatus::TimedOut, None));
+                    return step_outcome(
+                        step,
+                        log_path,
+                        StepStatus::TimedOut,
+                        None,
+                        Some(started_at),
+                    );
                 }
                 thread::sleep(Duration::from_millis(20));
             }
@@ -180,14 +197,26 @@ fn step_outcome(
     log_path: &Path,
     status: StepStatus,
     exit_code: Option<i32>,
-) -> StepOutcome {
-    StepOutcome {
+    started_at: Option<i64>,
+) -> Result<StepOutcome, ExecutorError> {
+    Ok(StepOutcome {
         name: step.name.clone(),
         command: step.run.clone(),
         status,
         exit_code,
         log_path: log_path.to_path_buf(),
-    }
+        started_at,
+        finished_at: timestamp_ms()?,
+    })
+}
+
+fn timestamp_ms() -> Result<i64, ExecutorError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| ExecutorError::ClockError(err.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|err| ExecutorError::ClockError(format!("timestamp is out of range: {err}")))
 }
 
 fn terminate_process_group(process_group: u32) -> Result<(), ExecutorError> {
@@ -286,9 +315,9 @@ pub fn execute_pipeline_with_cancellation(
                 .saturating_add(u64::from(remaining.subsec_nanos() > 0))
         });
         let outcome = if cancellation_requested.load(Ordering::Acquire) {
-            step_outcome(step, log_path, StepStatus::Cancelled, None)
+            step_outcome(step, log_path, StepStatus::Cancelled, None, None)?
         } else if build_time_remaining == Some(0) {
-            step_outcome(step, log_path, StepStatus::TimedOut, None)
+            step_outcome(step, log_path, StepStatus::TimedOut, None, None)?
         } else {
             let timeout = match (step_timeout, build_time_remaining) {
                 (Some(step), Some(build)) => Some(step.min(build)),

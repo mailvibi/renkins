@@ -265,6 +265,21 @@ async fn get_build_route(
     let steps = store
         .get_build_steps(&build_id)
         .map_err(|_| internal_error_response())?;
+    let steps = steps
+        .iter()
+        .map(|step| {
+            json!({
+                "step_index": step.step_index,
+                "name": step.name,
+                "command": step.command,
+                "status": step.status,
+                "exit_code": step.exit_code,
+                "started_at_ms": step.started_at,
+                "finished_at_ms": step.finished_at,
+                "duration_ms": duration_ms(step.started_at, step.finished_at)
+            })
+        })
+        .collect::<Vec<_>>();
     let resolved_commit = store
         .get_resolved_commit(&build_id)
         .map_err(|_| internal_error_response())?;
@@ -275,6 +290,10 @@ async fn get_build_route(
         "requested_ref": build.requested_ref,
         "resolved_commit": resolved_commit,
         "status": build_status(build.status),
+        "created_at_ms": build.created_at,
+        "started_at_ms": build.started_at,
+        "finished_at_ms": build.finished_at,
+        "duration_ms": duration_ms(build.started_at, build.finished_at),
         "pipeline": snapshot,
         "steps": steps
     }))
@@ -600,8 +619,18 @@ fn build_response(build: &Build) -> serde_json::Value {
         "job_id": build.job_id,
         "number": build.number,
         "requested_ref": build.requested_ref,
-        "status": build_status(build.status)
+        "status": build_status(build.status),
+        "created_at_ms": build.created_at,
+        "started_at_ms": build.started_at,
+        "finished_at_ms": build.finished_at,
+        "duration_ms": duration_ms(build.started_at, build.finished_at)
     })
+}
+
+fn duration_ms(started_at: Option<i64>, finished_at: Option<i64>) -> Option<i64> {
+    started_at
+        .zip(finished_at)
+        .and_then(|(started_at, finished_at)| finished_at.checked_sub(started_at))
 }
 
 fn build_status(status: BuildStatus) -> &'static str {
@@ -649,6 +678,7 @@ fn internal_error_response() -> (StatusCode, Json<serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StepOutcomeRecord;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -1029,5 +1059,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn build_detail_includes_persisted_build_and_step_timings() {
+        let mut store = DatabaseStore::open_in_memory().unwrap();
+        store.initialize_schema().unwrap();
+        store
+            .create_job(&Job {
+                id: "job-1".to_string(),
+                name: "timing".to_string(),
+                repository_url: "https://example.com/repo.git".to_string(),
+                default_ref: None,
+                disabled: false,
+            })
+            .unwrap();
+        store
+            .enqueue_build("build-1", "job-1", "refs/heads/main")
+            .unwrap();
+        assert!(store.claim_next_build().unwrap().is_some());
+        assert!(
+            store
+                .persist_pipeline_and_start(
+                    "build-1",
+                    "version: 1\nsteps:\n  - name: test\n    run: true\n",
+                )
+                .unwrap()
+        );
+        store
+            .record_step_outcomes(
+                "build-1",
+                &[StepOutcomeRecord {
+                    step_index: 0,
+                    status: "succeeded",
+                    exit_code: Some(0),
+                    started_at: Some(111),
+                    finished_at: 222,
+                }],
+            )
+            .unwrap();
+        assert!(
+            store
+                .transition_build("build-1", BuildStatus::Running, BuildStatus::Succeeded)
+                .unwrap()
+        );
+        let app = build_router_with_store("secret-token", store);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/builds/build-1")
+                    .header("Authorization", concat!("Bearer ", "secret-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(response["created_at_ms"].is_number());
+        assert!(response["started_at_ms"].is_number());
+        assert!(response["finished_at_ms"].is_number());
+        assert_eq!(
+            response["duration_ms"],
+            response["finished_at_ms"].as_i64().unwrap()
+                - response["started_at_ms"].as_i64().unwrap()
+        );
+        assert_eq!(response["steps"][0]["started_at_ms"], 111);
+        assert_eq!(response["steps"][0]["finished_at_ms"], 222);
+        assert_eq!(response["steps"][0]["duration_ms"], 111);
     }
 }

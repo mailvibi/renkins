@@ -50,6 +50,9 @@ pub struct Build {
     pub number: u64,
     pub requested_ref: String,
     pub status: BuildStatus,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -59,6 +62,7 @@ pub struct BuildStep {
     pub command: String,
     pub status: String,
     pub exit_code: Option<i32>,
+    pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
 }
 

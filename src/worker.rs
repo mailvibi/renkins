@@ -3,7 +3,7 @@ use crate::executor::{self, StepStatus};
 use crate::git;
 use crate::logs::{BuildLog, LogStream};
 use crate::pipeline::parse_pipeline_yaml;
-use crate::storage::DatabaseStore;
+use crate::storage::{DatabaseStore, StepOutcomeRecord};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs;
@@ -312,19 +312,19 @@ fn process_build(
                 StepStatus::TimedOut => "timed_out",
                 StepStatus::Cancelled => "cancelled",
             };
-            (index, status, outcome.exit_code)
+            StepOutcomeRecord {
+                step_index: index,
+                status,
+                exit_code: outcome.exit_code,
+                started_at: outcome.started_at,
+                finished_at: outcome.finished_at,
+            }
         })
         .collect::<Vec<_>>();
     let outcome_write = store
         .lock()
         .map_err(|_| "database store lock is poisoned".to_string())?
-        .record_step_outcomes(
-            &build.id,
-            &persisted_outcomes
-                .iter()
-                .map(|(index, status, code)| (*index, *status, *code))
-                .collect::<Vec<_>>(),
-        );
+        .record_step_outcomes(&build.id, &persisted_outcomes);
     if let Err(err) = outcome_write {
         let fail_result = fail_build(
             store,
@@ -574,6 +574,14 @@ steps:
 
         let build = store.lock().unwrap().get_build("build-1").unwrap().unwrap();
         assert_eq!(build.status, BuildStatus::Succeeded);
+        assert!(build.started_at.is_some());
+        assert!(build.finished_at.is_some());
+        assert!(
+            build
+                .finished_at
+                .zip(build.started_at)
+                .is_some_and(|(finished, started)| finished >= started)
+        );
         let checkout = dir.path().join("workspaces/build-1/checkout");
         assert_eq!(
             fs::read_to_string(checkout.join("marker.txt")).unwrap(),
@@ -592,6 +600,13 @@ steps:
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].status, "succeeded");
         assert!(steps[0].exit_code.is_some());
+        assert!(steps[0].started_at.is_some());
+        assert!(
+            steps[0]
+                .finished_at
+                .zip(steps[0].started_at)
+                .is_some_and(|(finished, started)| finished >= started)
+        );
         let log_page =
             crate::logs::read_page(&dir.path().join("logs/build-1.rkl"), None, 100, true)
                 .unwrap()

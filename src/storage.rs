@@ -5,13 +5,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_job_build_numbers.sql")),
     (3, include_str!("../migrations/0003_pipeline_snapshots.sql")),
     (4, include_str!("../migrations/0004_build_recovery.sql")),
     (5, include_str!("../migrations/0005_worker_execution.sql")),
+    (6, include_str!("../migrations/0006_step_timings.sql")),
 ];
 const MAX_PAGE_SIZE: u32 = 100;
 
@@ -25,6 +26,14 @@ pub enum EnqueueBuildError {
 pub struct DatabaseStore {
     pub path: PathBuf,
     conn: Connection,
+}
+
+pub struct StepOutcomeRecord<'a> {
+    pub step_index: usize,
+    pub status: &'a str,
+    pub exit_code: Option<i32>,
+    pub started_at: Option<i64>,
+    pub finished_at: i64,
 }
 
 impl DatabaseStore {
@@ -206,13 +215,17 @@ impl DatabaseStore {
             number,
             requested_ref: requested_ref.to_string(),
             status: crate::domain::BuildStatus::Queued,
+            created_at: now,
+            started_at: None,
+            finished_at: None,
         })
     }
 
     pub fn get_build(&self, id: &str) -> Result<Option<Build>, String> {
         self.conn
             .query_row(
-                "SELECT id, job_id, number, requested_ref, status FROM builds WHERE id = ?1",
+                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at
+                 FROM builds WHERE id = ?1",
                 [id],
                 Self::build_from_row,
             )
@@ -242,7 +255,8 @@ impl DatabaseStore {
             .map_err(|err| format!("failed to request build cancellation: {err}"))?;
         let build = transaction
             .query_row(
-                "SELECT id, job_id, number, requested_ref, status FROM builds WHERE id = ?1",
+                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at
+                 FROM builds WHERE id = ?1",
                 [id],
                 Self::build_from_row,
             )
@@ -283,7 +297,7 @@ impl DatabaseStore {
                      LIMIT 1
                  )
                  AND status = 'queued'
-                 RETURNING id, job_id, number, requested_ref, status",
+                 RETURNING id, job_id, number, requested_ref, status, created_at, started_at, finished_at",
                 [now],
                 Self::build_from_row,
             )
@@ -398,7 +412,7 @@ impl DatabaseStore {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT step_index, name, command, status, exit_code, finished_at
+                "SELECT step_index, name, command, status, exit_code, started_at, finished_at
                  FROM build_steps WHERE build_id = ?1 ORDER BY step_index",
             )
             .map_err(|err| format!("failed to prepare build step query: {err}"))?;
@@ -418,7 +432,8 @@ impl DatabaseStore {
                     command: row.get(2)?,
                     status: row.get(3)?,
                     exit_code: row.get(4)?,
-                    finished_at: row.get(5)?,
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
                 })
             })
             .map_err(|err| format!("failed to query build steps: {err}"))?;
@@ -429,7 +444,7 @@ impl DatabaseStore {
     pub fn record_step_outcomes(
         &self,
         build_id: &str,
-        outcomes: &[(usize, &str, Option<i32>)],
+        outcomes: &[StepOutcomeRecord<'_>],
     ) -> Result<(), String> {
         let transaction = self
             .conn
@@ -448,19 +463,28 @@ impl DatabaseStore {
         if !matches!(build_status.as_deref(), Some("running" | "cancelling")) {
             return Err(format!("build {build_id} is not running or cancelling"));
         }
-        for (step_index, status, exit_code) in outcomes {
-            if !matches!(*status, "succeeded" | "failed" | "timed_out" | "cancelled") {
-                return Err(format!("invalid step status '{status}'"));
+        for outcome in outcomes {
+            if !matches!(
+                outcome.status,
+                "succeeded" | "failed" | "timed_out" | "cancelled"
+            ) {
+                return Err(format!("invalid step status '{}'", outcome.status));
             }
-            let step_index = i64::try_from(*step_index)
+            let step_index = i64::try_from(outcome.step_index)
                 .map_err(|err| format!("step index is outside SQLite range: {err}"))?;
-            let now = Self::now_unix_millis()?;
             let changed = transaction
                 .execute(
                     "UPDATE build_steps
-                     SET status = ?1, finished_at = ?2, exit_code = ?3
-                     WHERE build_id = ?4 AND step_index = ?5 AND status = 'pending'",
-                    params![status, now, exit_code, build_id, step_index],
+                     SET status = ?1, started_at = ?2, finished_at = ?3, exit_code = ?4
+                     WHERE build_id = ?5 AND step_index = ?6 AND status = 'pending'",
+                    params![
+                        outcome.status,
+                        outcome.started_at,
+                        outcome.finished_at,
+                        outcome.exit_code,
+                        build_id,
+                        step_index
+                    ],
                 )
                 .map_err(|err| format!("failed to persist step outcome: {err}"))?;
             if changed != 1 {
@@ -479,7 +503,7 @@ impl DatabaseStore {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, job_id, number, requested_ref, status FROM builds
+                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at FROM builds
                  WHERE job_id = ?1 ORDER BY number DESC LIMIT ?2 OFFSET ?3",
             )
             .map_err(|err| format!("failed to prepare build list: {err}"))?;
@@ -586,6 +610,9 @@ impl DatabaseStore {
             number,
             requested_ref: row.get(3)?,
             status,
+            created_at: row.get(5)?,
+            started_at: row.get(6)?,
+            finished_at: row.get(7)?,
         })
     }
 
