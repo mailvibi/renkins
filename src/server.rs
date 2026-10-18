@@ -30,6 +30,13 @@ pub fn build_router(expected_token: &str) -> Result<Router, String> {
 }
 
 pub fn build_router_with_store(expected_token: &str, store: DatabaseStore) -> Router {
+    build_router_with_shared_store(expected_token, Arc::new(Mutex::new(store)))
+}
+
+fn build_router_with_shared_store(
+    expected_token: &str,
+    store: Arc<Mutex<DatabaseStore>>,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthcheck))
         .route("/readyz", get(healthcheck))
@@ -45,7 +52,7 @@ pub fn build_router_with_store(expected_token: &str, store: DatabaseStore) -> Ro
         .route("/api/v1/builds/{build_id}", get(get_build_route))
         .with_state(AppState {
             token: expected_token.to_string(),
-            store: Arc::new(Mutex::new(store)),
+            store,
         })
 }
 
@@ -57,7 +64,12 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
     let mut store = DatabaseStore::open(&database_path)?;
     store.initialize_schema()?;
     store.recover_abandoned_builds()?;
-    let router = build_router_with_store(&token, store);
+    let store = Arc::new(Mutex::new(store));
+    crate::worker::start_worker(
+        Arc::clone(&store),
+        Path::new(&config.data_dir).to_path_buf(),
+    )?;
+    let router = build_router_with_shared_store(&token, store);
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .map_err(|err| format!("failed to bind {}: {err}", config.listen))?;
@@ -222,13 +234,21 @@ async fn get_build_route(
     let snapshot = store
         .get_pipeline_snapshot(&build_id)
         .map_err(|_| internal_error_response())?;
+    let steps = store
+        .get_build_steps(&build_id)
+        .map_err(|_| internal_error_response())?;
+    let resolved_commit = store
+        .get_resolved_commit(&build_id)
+        .map_err(|_| internal_error_response())?;
     Ok(Json(json!({
         "id": build.id,
         "job_id": build.job_id,
         "number": build.number,
         "requested_ref": build.requested_ref,
+        "resolved_commit": resolved_commit,
         "status": build_status(build.status),
-        "pipeline": snapshot
+        "pipeline": snapshot,
+        "steps": steps
     }))
     .into_response())
 }

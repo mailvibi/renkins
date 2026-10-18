@@ -30,6 +30,7 @@ pub struct StepOutcome {
 pub enum ExecutorError {
     SpawnFailed(String),
     InvalidWorkingDirectory,
+    InvalidTimeout,
     LogWriteFailed(String),
     CommandFailed(i32),
     TimedOut,
@@ -84,12 +85,26 @@ pub fn run_step(
     log_path: &Path,
     timeout_seconds: Option<u64>,
 ) -> Result<StepOutcome, ExecutorError> {
+    let deadline = match timeout_seconds {
+        Some(seconds) => Some(
+            Instant::now()
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or(ExecutorError::InvalidTimeout)?,
+        ),
+        None => None,
+    };
     let mut command = Command::new("/bin/sh");
     command
-        .current_dir(workspace)
+        .current_dir(
+            step.working_directory
+                .as_deref()
+                .map(|directory| workspace.join(directory))
+                .unwrap_or_else(|| workspace.to_path_buf()),
+        )
         .arg("-eu")
         .arg("-c")
         .arg(&step.run)
+        .envs(&step.env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -107,8 +122,6 @@ pub fn run_step(
     let stderr_thread = read_stream(stderr, stderr_log, "stderr".to_string());
     let process_group = child.id();
 
-    let timeout = timeout_seconds.map(Duration::from_secs);
-    let deadline = timeout.map(|d| Instant::now() + d);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -204,11 +217,46 @@ pub fn execute_pipeline(
 ) -> Result<Vec<StepOutcome>, ExecutorError> {
     ensure_log_file(log_path)?;
     let mut results = Vec::with_capacity(steps.len());
+    let build_deadline = match timeout_seconds {
+        Some(seconds) => Some(
+            Instant::now()
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or(ExecutorError::InvalidTimeout)?,
+        ),
+        None => None,
+    };
 
     for step in steps {
         let step_log = log_path.to_path_buf();
         append_line(&step_log, &format!("[step] {}", step.name))?;
-        let outcome = run_step(step, workspace, &step_log, timeout_seconds)?;
+        let step_timeout = step
+            .timeout_minutes
+            .map(|minutes| minutes.saturating_mul(60));
+        let build_time_remaining = build_deadline.map(|deadline| {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+        });
+        if build_time_remaining == Some(0) {
+            results.push(StepOutcome {
+                name: step.name.clone(),
+                command: step.run.clone(),
+                status: StepStatus::TimedOut,
+                exit_code: None,
+                log_path: log_path.to_path_buf(),
+            });
+            break;
+        }
+        let timeout = match (step_timeout, build_time_remaining) {
+            (Some(step), Some(build)) => Some(step.min(build)),
+            (Some(step), None) => Some(step),
+            (None, Some(build)) => Some(build),
+            (None, None) => None,
+        };
+        let outcome = run_step(step, workspace, &step_log, timeout)?;
         results.push(outcome);
         if matches!(
             results.last().unwrap().status,
@@ -253,6 +301,54 @@ mod tests {
         assert!(matches!(outcomes[0].status, StepStatus::Succeeded));
         assert!(matches!(outcomes[1].status, StepStatus::Succeeded));
         assert!(workspace.join("output.txt").exists());
+    }
+
+    #[test]
+    fn applies_step_working_directory_and_environment() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let working_directory = workspace.join("nested");
+        fs::create_dir(&working_directory).unwrap();
+        let log_path = workspace.join("configured.log");
+        let step = StepConfig {
+            name: "configured".to_string(),
+            run: "printf '%s' \"$STEP_VALUE\" > output.txt".to_string(),
+            working_directory: Some("nested".to_string()),
+            timeout_minutes: None,
+            env: [("STEP_VALUE".to_string(), "present".to_string())].into(),
+        };
+
+        let outcome = run_step(&step, workspace, &log_path, Some(5)).unwrap();
+
+        assert_eq!(outcome.status, StepStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(working_directory.join("output.txt")).unwrap(),
+            "present"
+        );
+    }
+
+    #[test]
+    fn rejects_timeout_outside_monotonic_clock_range_before_spawning() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("unexpected");
+        let step = StepConfig {
+            name: "invalid-timeout".to_string(),
+            run: format!("touch '{}'", marker.display()),
+            working_directory: None,
+            timeout_minutes: None,
+            env: Default::default(),
+        };
+
+        assert!(matches!(
+            run_step(
+                &step,
+                dir.path(),
+                &dir.path().join("build.log"),
+                Some(u64::MAX)
+            ),
+            Err(ExecutorError::InvalidTimeout)
+        ));
+        assert!(!marker.exists());
     }
 
     #[test]

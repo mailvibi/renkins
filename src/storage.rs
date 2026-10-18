@@ -1,16 +1,17 @@
-use crate::domain::{Build, Job};
+use crate::domain::{Build, BuildStep, Job};
 use crate::pipeline::{PipelineConfig, parse_pipeline_yaml};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_job_build_numbers.sql")),
     (3, include_str!("../migrations/0003_pipeline_snapshots.sql")),
     (4, include_str!("../migrations/0004_build_recovery.sql")),
+    (5, include_str!("../migrations/0005_worker_execution.sql")),
 ];
 const MAX_PAGE_SIZE: u32 = 100;
 
@@ -232,6 +233,7 @@ impl DatabaseStore {
     }
 
     pub fn claim_next_build(&mut self) -> Result<Option<Build>, String> {
+        let now = Self::now_unix_millis()?;
         let transaction = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -239,7 +241,7 @@ impl DatabaseStore {
         let build = transaction
             .query_row(
                 "UPDATE builds
-                 SET status = 'preparing'
+                 SET status = 'preparing', started_at = ?1
                  WHERE id = (
                      SELECT id FROM builds
                      WHERE status = 'queued'
@@ -248,7 +250,7 @@ impl DatabaseStore {
                  )
                  AND status = 'queued'
                  RETURNING id, job_id, number, requested_ref, status",
-                [],
+                [now],
                 Self::build_from_row,
             )
             .optional()
@@ -257,6 +259,29 @@ impl DatabaseStore {
             .commit()
             .map_err(|err| format!("failed to commit queue claim: {err}"))?;
         Ok(build)
+    }
+
+    pub fn record_resolved_commit(&self, build_id: &str, commit: &str) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "UPDATE builds SET resolved_commit = ?1
+                 WHERE id = ?2 AND status = 'preparing' AND resolved_commit IS NULL",
+                params![commit, build_id],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| format!("failed to record resolved commit: {err}"))
+    }
+
+    pub fn get_resolved_commit(&self, build_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT resolved_commit FROM builds WHERE id = ?1",
+                [build_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to read resolved commit: {err}"))
+            .map(Option::flatten)
     }
 
     pub fn persist_pipeline_and_start(
@@ -335,6 +360,86 @@ impl DatabaseStore {
             .transpose()
     }
 
+    pub fn get_build_steps(&self, build_id: &str) -> Result<Vec<BuildStep>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT step_index, name, command, status, exit_code, finished_at
+                 FROM build_steps WHERE build_id = ?1 ORDER BY step_index",
+            )
+            .map_err(|err| format!("failed to prepare build step query: {err}"))?;
+        let rows = statement
+            .query_map([build_id], |row| {
+                let step_index: i64 = row.get(0)?;
+                let step_index = u32::try_from(step_index).map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "step_index".to_string(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?;
+                Ok(BuildStep {
+                    step_index,
+                    name: row.get(1)?,
+                    command: row.get(2)?,
+                    status: row.get(3)?,
+                    exit_code: row.get(4)?,
+                    finished_at: row.get(5)?,
+                })
+            })
+            .map_err(|err| format!("failed to query build steps: {err}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("failed to read build steps: {err}"))
+    }
+
+    pub fn record_step_outcomes(
+        &self,
+        build_id: &str,
+        outcomes: &[(usize, &str, Option<i32>)],
+    ) -> Result<(), String> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| format!("failed to begin step outcome transaction: {err}"))?;
+        let build_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM builds WHERE id = ?1",
+                [build_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| {
+                format!("failed to inspect build before recording step outcomes: {err}")
+            })?;
+        if build_status.as_deref() != Some("running") {
+            return Err(format!("build {build_id} is not running"));
+        }
+        for (step_index, status, exit_code) in outcomes {
+            if !matches!(*status, "succeeded" | "failed" | "timed_out" | "cancelled") {
+                return Err(format!("invalid step status '{status}'"));
+            }
+            let step_index = i64::try_from(*step_index)
+                .map_err(|err| format!("step index is outside SQLite range: {err}"))?;
+            let now = Self::now_unix_millis()?;
+            let changed = transaction
+                .execute(
+                    "UPDATE build_steps
+                     SET status = ?1, finished_at = ?2, exit_code = ?3
+                     WHERE build_id = ?4 AND step_index = ?5 AND status = 'pending'",
+                    params![status, now, exit_code, build_id, step_index],
+                )
+                .map_err(|err| format!("failed to persist step outcome: {err}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "step {step_index} for build {build_id} is missing or already finished"
+                ));
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|err| format!("failed to commit step outcomes: {err}"))
+    }
+
     pub fn list_builds(&self, job_id: &str, limit: u32, offset: u32) -> Result<Vec<Build>, String> {
         Self::validate_page(limit)?;
         let mut statement = self
@@ -357,6 +462,16 @@ impl DatabaseStore {
         expected: crate::domain::BuildStatus,
         next: crate::domain::BuildStatus,
     ) -> Result<bool, String> {
+        self.transition_build_with_failure(id, expected, next, None)
+    }
+
+    pub fn transition_build_with_failure(
+        &self,
+        id: &str,
+        expected: crate::domain::BuildStatus,
+        next: crate::domain::BuildStatus,
+        failure_kind: Option<&str>,
+    ) -> Result<bool, String> {
         if !expected.can_transition_to(next) {
             return Err(format!(
                 "invalid build status transition from {expected:?} to {next:?}"
@@ -370,6 +485,10 @@ impl DatabaseStore {
                      finished_at = CASE
                          WHEN ?1 IN ('succeeded', 'failed', 'cancelled', 'interrupted') THEN ?4
                          ELSE finished_at
+                     END,
+                     failure_kind = CASE
+                         WHEN ?1 IN ('failed', 'interrupted') THEN ?5
+                         ELSE failure_kind
                      END
                  WHERE id = ?2 AND status = ?3
                  AND (?1 != 'running' OR (
@@ -380,7 +499,8 @@ impl DatabaseStore {
                     Self::status_as_str(next),
                     id,
                     Self::status_as_str(expected),
-                    Self::now_unix_millis()?
+                    Self::now_unix_millis()?,
+                    failure_kind
                 ],
             )
             .map_err(|err| format!("failed to transition build: {err}"))?;

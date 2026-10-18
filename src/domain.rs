@@ -52,6 +52,16 @@ pub struct Build {
     pub status: BuildStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BuildStep {
+    pub step_index: u32,
+    pub name: String,
+    pub command: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub finished_at: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

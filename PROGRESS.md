@@ -2,6 +2,18 @@
 
 ## Current handoff
 
+The durable worker execution slice is now implemented:
+
+- Server startup launches one polling worker sharing the SQLite store with the API. Claims and metadata operations hold the store lock only for storage calls; checkout and shell execution run without holding it.
+- The worker claims queued builds, creates a per-build checkout and log, checks out the requested ref, and records the resolved commit.
+- It validates `.renkins.yml` and uses `persist_pipeline_and_start`; step execution begins only after that transaction commits successfully.
+- Step execution applies each step's working directory and environment, the build-wide timeout, and any shorter per-step timeout. Step outcomes and terminal state/failure kind are persisted.
+- Build detail returns the resolved commit and persisted step outcomes.
+- Added schema migration 5 for build start/resolved-commit and per-step completion/exit-code fields.
+- Added worker tests for success, invalid pipeline handling, and an injected SQLite trigger failure proving no step command runs before pipeline persistence.
+
+Validation passed: `cargo test --all-targets` (49 tests), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`, and `git diff --check`.
+
 The latest session hardened step process cleanup:
 
 - Step shells now run in their own process group. Timeout terminates the process group with SIGTERM then SIGKILL, waits for the direct child, and joins both output drainers.
@@ -26,10 +38,10 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-The HTTP API does not yet provide cancellation or log retrieval, and no durable scheduler worker dispatches queued builds. Build details do not yet contain full step outcomes/timing. Readiness still does not reflect scheduler state. Next roadmap slice: connect a worker loop to durable claim, checkout, pipeline snapshot, step execution, and terminal/step outcome persistence, reusing this process cleanup. Ensure a snapshot transaction commits before any repository command executes. Continue comparing implementation with [PLAN.md](./PLAN.md) and verify acceptance criteria before declaring a phase complete.
+The worker is currently a single polling loop with no configured concurrency or graceful shutdown. The HTTP API does not yet provide cancellation or log retrieval; although logs are written to per-build files, there is no bounded read/tail API or structured record format. Build-level API timing is also incomplete. Readiness does not reflect worker state. Next roadmap slice: persist and expose richer build/step timing and log metadata, then implement cancellation and bounded log retrieval. Follow with configurable worker concurrency and graceful shutdown, scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Continue comparing implementation with [PLAN.md](./PLAN.md) and verify acceptance criteria before declaring a phase complete.
 
 ## Continuation and commits
 
 - Keep the main branch compiling and tested after each logical implementation step.
 - Commit each independently completed implementation step with its tests and directly related documentation.
-- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 4. Server startup invokes persisted recovery; job and build inspection/control routes implemented so far use SQLite. This remains partial coverage of Phase 6, not completion of the scheduler.
+- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 5. Server startup invokes persisted recovery; job/build APIs and the single worker use SQLite. This remains partial coverage of Phase 6, not completion of the scheduler.
