@@ -21,12 +21,18 @@ pub struct WorkerControl {
     active_builds: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     claim_gate: Arc<Mutex<()>>,
     shutdown_requested: Arc<AtomicBool>,
+    scheduler_ready: Arc<AtomicBool>,
 }
 
 impl WorkerControl {
+    pub fn is_ready(&self) -> bool {
+        self.scheduler_ready.load(Ordering::Acquire)
+    }
+
     pub fn request_shutdown(&self) -> Result<(), String> {
         let claim_gate = self.claim_gate.lock();
         self.shutdown_requested.store(true, Ordering::Release);
+        self.scheduler_ready.store(false, Ordering::Release);
         claim_gate
             .map(|_| ())
             .map_err(|_| "worker claim gate is poisoned".to_string())
@@ -86,6 +92,16 @@ impl Drop for ActiveBuildGuard {
         if let Ok(mut active_builds) = self.control.active_builds.lock() {
             active_builds.remove(&self.build_id);
         }
+    }
+}
+
+struct WorkerThreadGuard {
+    control: WorkerControl,
+}
+
+impl Drop for WorkerThreadGuard {
+    fn drop(&mut self) {
+        self.control.scheduler_ready.store(false, Ordering::Release);
     }
 }
 
@@ -190,6 +206,7 @@ pub fn start_worker_pool(
             "worker concurrency must be between 1 and {MAX_CONCURRENT_BUILDS}"
         ));
     }
+    control.scheduler_ready.store(true, Ordering::Release);
     let mut workers = Vec::with_capacity(concurrency);
     for index in 0..concurrency {
         let worker_store = Arc::clone(&store);
@@ -198,6 +215,9 @@ pub fn start_worker_pool(
         let worker = thread::Builder::new()
             .name(format!("renkins-worker-{index}"))
             .spawn(move || {
+                let _thread_guard = WorkerThreadGuard {
+                    control: worker_control.clone(),
+                };
                 loop {
                     if worker_control.shutdown_requested.load(Ordering::Acquire) {
                         break;

@@ -1,5 +1,11 @@
 # Development Progress
 
+## Latest handoff: scheduler-aware readiness
+
+`/readyz` is now separate from `/healthz` and reports readiness only when the current SQLite schema/query path is available and the bounded worker pool has started. It returns `503` before scheduler startup or after shutdown begins. Database readiness failures are logged without exposing internal details in the HTTP response.
+
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (65 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+
 ## Latest handoff: worker concurrency and graceful shutdown
 
 The server now uses a bounded worker pool configured with `max_concurrent_builds` (default 1, maximum 32) and `shutdown_grace_seconds` (default 30, maximum 3600):

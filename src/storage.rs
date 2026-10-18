@@ -115,6 +115,22 @@ impl DatabaseStore {
         Ok(())
     }
 
+    pub fn check_readiness(&self) -> Result<(), String> {
+        let version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|err| format!("failed to read sqlite schema version: {err}"))?;
+        if version != SCHEMA_VERSION {
+            return Err(format!(
+                "sqlite schema version {version} does not match required version {SCHEMA_VERSION}"
+            ));
+        }
+        self.conn
+            .query_row("SELECT 1", [], |row| row.get::<_, i32>(0))
+            .map(|_| ())
+            .map_err(|err| format!("sqlite readiness query failed: {err}"))
+    }
+
     pub fn create_job(&self, job: &Job) -> Result<(), String> {
         let now = Self::now_unix_millis()?;
         self.conn.execute(
@@ -1113,6 +1129,14 @@ mod tests {
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         assert_eq!(busy_timeout, 5_000);
+    }
+
+    #[test]
+    fn readiness_requires_the_current_schema_and_a_queryable_database() {
+        let mut store = DatabaseStore::open_in_memory().unwrap();
+        assert!(store.check_readiness().is_err());
+        store.initialize_schema().unwrap();
+        assert!(store.check_readiness().is_ok());
     }
 
     fn test_job(id: &str, name: &str) -> Job {

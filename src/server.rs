@@ -57,7 +57,7 @@ fn build_router_with_shared_store(
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthcheck))
-        .route("/readyz", get(healthcheck))
+        .route("/readyz", get(readycheck))
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs", post(create_job_route))
         .route("/api/v1/jobs/{job_id}", get(get_job_route))
@@ -168,6 +168,25 @@ pub fn load_server_config(config_path: Option<&Path>) -> Result<ServerConfig, St
 
 async fn healthcheck() -> StatusCode {
     StatusCode::OK
+}
+
+async fn readycheck(State(state): State<AppState>) -> StatusCode {
+    if !state.worker_control.is_ready() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    match state.store.lock() {
+        Ok(store) => match store.check_readiness() {
+            Ok(()) => StatusCode::OK,
+            Err(err) => {
+                eprintln!("database is not ready: {err}");
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        },
+        Err(_) => {
+            eprintln!("database store lock is poisoned during readiness check");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
 }
 
 async fn list_jobs(
@@ -762,7 +781,45 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn readiness_tracks_schema_and_scheduler_state() {
+        let mut store = DatabaseStore::open_in_memory().unwrap();
+        store.initialize_schema().unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let control = WorkerControl::default();
+        let dir = tempdir().unwrap();
+        let app = build_router_with_shared_store(
+            "secret-token",
+            Arc::clone(&store),
+            dir.path().join("logs"),
+            control.clone(),
+        );
+        let ready_request = || {
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(ready_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let worker = crate::worker::start_worker_pool(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            control.clone(),
+            1,
+        )
+        .unwrap();
+        let response = app.clone().oneshot(ready_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        control.request_shutdown().unwrap();
+        let response = app.oneshot(ready_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        worker.shutdown(Duration::ZERO).unwrap();
     }
 
     #[tokio::test]
