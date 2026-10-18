@@ -1,11 +1,11 @@
-use crate::domain::{Build, BuildStep, Job};
+use crate::domain::{Build, BuildCancellationReason, BuildStep, Job};
 use crate::pipeline::{PipelineConfig, parse_pipeline_yaml};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_job_build_numbers.sql")),
@@ -13,6 +13,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (4, include_str!("../migrations/0004_build_recovery.sql")),
     (5, include_str!("../migrations/0005_worker_execution.sql")),
     (6, include_str!("../migrations/0006_step_timings.sql")),
+    (
+        7,
+        include_str!("../migrations/0007_cancellation_reason.sql"),
+    ),
 ];
 const MAX_PAGE_SIZE: u32 = 100;
 
@@ -218,13 +222,16 @@ impl DatabaseStore {
             created_at: now,
             started_at: None,
             finished_at: None,
+            cancel_requested_at: None,
+            cancel_reason: None,
         })
     }
 
     pub fn get_build(&self, id: &str) -> Result<Option<Build>, String> {
         self.conn
             .query_row(
-                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at
+                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at,
+                        cancel_requested_at, cancel_reason
                  FROM builds WHERE id = ?1",
                 [id],
                 Self::build_from_row,
@@ -233,7 +240,11 @@ impl DatabaseStore {
             .map_err(|err| format!("failed to get build: {err}"))
     }
 
-    pub fn request_build_cancellation(&mut self, id: &str) -> Result<Option<Build>, String> {
+    pub fn request_build_cancellation(
+        &mut self,
+        id: &str,
+        reason: BuildCancellationReason,
+    ) -> Result<Option<Build>, String> {
         let now = Self::now_unix_millis()?;
         let transaction = self
             .conn
@@ -248,14 +259,17 @@ impl DatabaseStore {
                      WHEN 'running' THEN 'cancelling'
                      ELSE status
                  END,
-                 finished_at = CASE WHEN status = 'queued' THEN ?1 ELSE finished_at END
+                 finished_at = CASE WHEN status = 'queued' THEN ?1 ELSE finished_at END,
+                 cancel_requested_at = ?1,
+                 cancel_reason = ?3
                  WHERE id = ?2 AND status IN ('queued', 'preparing', 'running')",
-                params![now, id],
+                params![now, id, reason.as_str()],
             )
             .map_err(|err| format!("failed to request build cancellation: {err}"))?;
         let build = transaction
             .query_row(
-                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at
+                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at,
+                        cancel_requested_at, cancel_reason
                  FROM builds WHERE id = ?1",
                 [id],
                 Self::build_from_row,
@@ -297,7 +311,8 @@ impl DatabaseStore {
                      LIMIT 1
                  )
                  AND status = 'queued'
-                 RETURNING id, job_id, number, requested_ref, status, created_at, started_at, finished_at",
+                 RETURNING id, job_id, number, requested_ref, status, created_at, started_at, finished_at,
+                           cancel_requested_at, cancel_reason",
                 [now],
                 Self::build_from_row,
             )
@@ -503,7 +518,8 @@ impl DatabaseStore {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at FROM builds
+                "SELECT id, job_id, number, requested_ref, status, created_at, started_at, finished_at,
+                        cancel_requested_at, cancel_reason FROM builds
                  WHERE job_id = ?1 ORDER BY number DESC LIMIT ?2 OFFSET ?3",
             )
             .map_err(|err| format!("failed to prepare build list: {err}"))?;
@@ -613,6 +629,8 @@ impl DatabaseStore {
             created_at: row.get(5)?,
             started_at: row.get(6)?,
             finished_at: row.get(7)?,
+            cancel_requested_at: row.get(8)?,
+            cancel_reason: row.get(9)?,
         })
     }
 

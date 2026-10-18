@@ -16,6 +16,6 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 toml = "0.8"
 tempfile = "3.0"
-tokio = { version = "1.41", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "signal"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }

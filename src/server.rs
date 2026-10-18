@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -14,7 +15,7 @@ use crate::api::{
     BuildEnqueueRequest, JobCreateRequest, JobResponse, create_job, validate_build_ref,
 };
 use crate::config::{ServerConfig, read_or_create_token_file, validate_token_header};
-use crate::domain::{Build, BuildStatus, Job};
+use crate::domain::{Build, BuildCancellationReason, BuildStatus, Job};
 use crate::logs::{ReadLogError, read_page};
 use crate::storage::{DatabaseStore, EnqueueBuildError};
 use crate::worker::WorkerControl;
@@ -86,27 +87,71 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
     store.initialize_schema()?;
     store.recover_abandoned_builds()?;
     let store = Arc::new(Mutex::new(store));
+    let listener = tokio::net::TcpListener::bind(&config.listen)
+        .await
+        .map_err(|err| format!("failed to bind {}: {err}", config.listen))?;
     let worker_control = WorkerControl::default();
-    crate::worker::start_worker(
+    let worker = crate::worker::start_worker_pool(
         Arc::clone(&store),
         Path::new(&config.data_dir).to_path_buf(),
         worker_control.clone(),
+        config.max_concurrent_builds,
     )?;
     let router = build_router_with_shared_store(
         &token,
         store,
         Path::new(&config.data_dir).join("logs"),
-        worker_control,
+        worker_control.clone(),
     );
-    let listener = tokio::net::TcpListener::bind(&config.listen)
+    let signal_control = worker_control;
+    let server_result = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown_signal().await;
+            if let Err(err) = signal_control.request_shutdown() {
+                eprintln!("failed to stop build claims during shutdown: {err}");
+            }
+        })
         .await
-        .map_err(|err| format!("failed to bind {}: {err}", config.listen))?;
+        .map_err(|err| format!("server exited with error: {err}"));
 
-    axum::serve(listener, router)
-        .await
-        .map_err(|err| format!("server exited with error: {err}"))?;
+    let worker_result = worker.shutdown(Duration::from_secs(config.shutdown_grace_seconds));
+    match (server_result, worker_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(server_err), Ok(())) => Err(server_err),
+        (Ok(()), Err(worker_err)) => Err(format!("worker shutdown failed: {worker_err}")),
+        (Err(server_err), Err(worker_err)) => Err(format!(
+            "{server_err}; worker shutdown failed: {worker_err}"
+        )),
+    }
+}
 
-    Ok(())
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = ctrl_c => {
+                        if let Err(err) = result {
+                            eprintln!("failed to listen for Ctrl-C: {err}");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(err) => {
+                eprintln!("failed to listen for SIGTERM: {err}");
+                if let Err(err) = ctrl_c.await {
+                    eprintln!("failed to listen for Ctrl-C: {err}");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(err) = ctrl_c.await {
+        eprintln!("failed to listen for Ctrl-C: {err}");
+    }
 }
 
 pub fn default_server_config() -> ServerConfig {
@@ -294,6 +339,8 @@ async fn get_build_route(
         "started_at_ms": build.started_at,
         "finished_at_ms": build.finished_at,
         "duration_ms": duration_ms(build.started_at, build.finished_at),
+        "cancel_requested_at_ms": build.cancel_requested_at,
+        "cancel_reason": build.cancel_reason,
         "pipeline": snapshot,
         "steps": steps
     }))
@@ -312,7 +359,7 @@ async fn cancel_build_route(
         .store
         .lock()
         .map_err(|_| internal_error_response())?
-        .request_build_cancellation(&build_id)
+        .request_build_cancellation(&build_id, BuildCancellationReason::User)
         .map_err(|_| internal_error_response())?;
     let Some(build) = build else {
         return Ok(not_found_response(
@@ -330,7 +377,9 @@ async fn cancel_build_route(
         "id": build.id,
         "job_id": build.job_id,
         "number": build.number,
-        "status": build_status(build.status)
+        "status": build_status(build.status),
+        "cancel_requested_at_ms": build.cancel_requested_at,
+        "cancel_reason": build.cancel_reason
     }))
     .into_response())
 }
@@ -623,7 +672,9 @@ fn build_response(build: &Build) -> serde_json::Value {
         "created_at_ms": build.created_at,
         "started_at_ms": build.started_at,
         "finished_at_ms": build.finished_at,
-        "duration_ms": duration_ms(build.started_at, build.finished_at)
+        "duration_ms": duration_ms(build.started_at, build.finished_at),
+        "cancel_requested_at_ms": build.cancel_requested_at,
+        "cancel_reason": build.cancel_reason
     })
 }
 
@@ -1045,6 +1096,8 @@ mod tests {
             let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
             let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(response["status"], "cancelled");
+            assert_eq!(response["cancel_reason"], "user");
+            assert!(response["cancel_requested_at_ms"].is_number());
         }
 
         let missing = app

@@ -3,6 +3,11 @@ use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 
+pub const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 1;
+pub const MAX_CONCURRENT_BUILDS: usize = 32;
+pub const DEFAULT_SHUTDOWN_GRACE_SECONDS: u64 = 30;
+pub const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 3_600;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -11,6 +16,8 @@ pub struct ServerConfig {
     pub listen: String,
     pub data_dir: String,
     pub auth_token_file: String,
+    pub max_concurrent_builds: usize,
+    pub shutdown_grace_seconds: u64,
 }
 
 impl ServerConfig {
@@ -35,7 +42,29 @@ impl ServerConfig {
             listen,
             data_dir,
             auth_token_file,
+            max_concurrent_builds: DEFAULT_MAX_CONCURRENT_BUILDS,
+            shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
         })
+    }
+
+    pub fn with_worker_settings(
+        mut self,
+        max_concurrent_builds: usize,
+        shutdown_grace_seconds: u64,
+    ) -> Result<Self, String> {
+        if !(1..=MAX_CONCURRENT_BUILDS).contains(&max_concurrent_builds) {
+            return Err(format!(
+                "max_concurrent_builds must be between 1 and {MAX_CONCURRENT_BUILDS}"
+            ));
+        }
+        if shutdown_grace_seconds > MAX_SHUTDOWN_GRACE_SECONDS {
+            return Err(format!(
+                "shutdown_grace_seconds must not exceed {MAX_SHUTDOWN_GRACE_SECONDS}"
+            ));
+        }
+        self.max_concurrent_builds = max_concurrent_builds;
+        self.shutdown_grace_seconds = shutdown_grace_seconds;
+        Ok(self)
     }
 }
 
@@ -51,12 +80,25 @@ pub fn parse_server_config_str(contents: &str) -> Result<ServerConfig, String> {
         listen: String,
         data_dir: String,
         auth_token_file: String,
+        #[serde(default = "default_max_concurrent_builds")]
+        max_concurrent_builds: usize,
+        #[serde(default = "default_shutdown_grace_seconds")]
+        shutdown_grace_seconds: u64,
     }
 
     let config: RawServerConfig =
         toml::from_str(contents).map_err(|err| format!("invalid server config: {err}"))?;
 
-    ServerConfig::new(config.listen, config.data_dir, config.auth_token_file)
+    ServerConfig::new(config.listen, config.data_dir, config.auth_token_file)?
+        .with_worker_settings(config.max_concurrent_builds, config.shutdown_grace_seconds)
+}
+
+fn default_max_concurrent_builds() -> usize {
+    DEFAULT_MAX_CONCURRENT_BUILDS
+}
+
+fn default_shutdown_grace_seconds() -> u64 {
+    DEFAULT_SHUTDOWN_GRACE_SECONDS
 }
 
 pub fn parse_listen_address(value: &str) -> Result<String, String> {
@@ -231,6 +273,39 @@ mod tests {
         assert_eq!(parsed.listen, "127.0.0.1:8080");
         assert_eq!(parsed.data_dir, "./data");
         assert_eq!(parsed.auth_token_file, "./data/admin-token");
+        assert_eq!(parsed.max_concurrent_builds, DEFAULT_MAX_CONCURRENT_BUILDS);
+        assert_eq!(
+            parsed.shutdown_grace_seconds,
+            DEFAULT_SHUTDOWN_GRACE_SECONDS
+        );
+    }
+
+    #[test]
+    fn parses_and_validates_worker_settings() {
+        let config = r#"
+            listen = "127.0.0.1:8080"
+            data_dir = "./data"
+            auth_token_file = "./data/admin-token"
+            max_concurrent_builds = 4
+            shutdown_grace_seconds = 15
+        "#;
+
+        let parsed = parse_server_config_str(config).unwrap();
+        assert_eq!(parsed.max_concurrent_builds, 4);
+        assert_eq!(parsed.shutdown_grace_seconds, 15);
+
+        assert!(
+            ServerConfig::new("127.0.0.1:8080", "./data", "./data/token")
+                .unwrap()
+                .with_worker_settings(0, 15)
+                .is_err()
+        );
+        assert!(
+            ServerConfig::new("127.0.0.1:8080", "./data", "./data/token")
+                .unwrap()
+                .with_worker_settings(1, MAX_SHUTDOWN_GRACE_SECONDS + 1)
+                .is_err()
+        );
     }
 
     #[test]

@@ -53,6 +53,23 @@ pub struct Build {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    pub cancel_requested_at: Option<i64>,
+    pub cancel_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildCancellationReason {
+    User,
+    ServerShutdown,
+}
+
+impl BuildCancellationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::ServerShutdown => "server_shutdown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]

@@ -1,4 +1,5 @@
-use crate::domain::{Build, BuildStatus};
+use crate::config::MAX_CONCURRENT_BUILDS;
+use crate::domain::{Build, BuildCancellationReason, BuildStatus};
 use crate::executor::{self, StepStatus};
 use crate::git;
 use crate::logs::{BuildLog, LogStream};
@@ -11,16 +12,34 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkerControl {
     active_builds: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    claim_gate: Arc<Mutex<()>>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl WorkerControl {
+    pub fn request_shutdown(&self) -> Result<(), String> {
+        let claim_gate = self.claim_gate.lock();
+        self.shutdown_requested.store(true, Ordering::Release);
+        claim_gate
+            .map(|_| ())
+            .map_err(|_| "worker claim gate is poisoned".to_string())
+    }
+
+    fn active_build_ids(&self) -> Result<Vec<String>, String> {
+        let active_builds = self
+            .active_builds
+            .lock()
+            .map_err(|_| "worker control lock is poisoned".to_string())?;
+        Ok(active_builds.keys().cloned().collect())
+    }
+
     pub fn cancel_active(&self, build_id: &str) -> Result<bool, String> {
         let active_builds = self
             .active_builds
@@ -70,27 +89,155 @@ impl Drop for ActiveBuildGuard {
     }
 }
 
+pub struct WorkerHandle {
+    store: Arc<Mutex<DatabaseStore>>,
+    control: WorkerControl,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    pub fn shutdown(self, grace_period: Duration) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Err(err) = self.control.request_shutdown() {
+            errors.push(err);
+        }
+        let deadline = Instant::now().checked_add(grace_period);
+        if deadline.is_none() {
+            errors.push("shutdown grace period is outside the monotonic clock range".to_string());
+        }
+        loop {
+            let active_builds = match self.control.active_build_ids() {
+                Ok(active_builds) => active_builds,
+                Err(err) => {
+                    errors.push(err);
+                    break;
+                }
+            };
+            if active_builds.is_empty()
+                || deadline.is_none_or(|deadline| Instant::now() >= deadline)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let active_builds = match self.control.active_build_ids() {
+            Ok(active_builds) => active_builds,
+            Err(err) => {
+                errors.push(err);
+                Vec::new()
+            }
+        };
+        if !active_builds.is_empty() {
+            for build_id in active_builds {
+                let cancellation = self
+                    .store
+                    .lock()
+                    .map_err(|_| "database store lock is poisoned".to_string())
+                    .and_then(|mut store| {
+                        store.request_build_cancellation(
+                            &build_id,
+                            BuildCancellationReason::ServerShutdown,
+                        )
+                    });
+                match cancellation {
+                    Ok(Some(build)) if build.status == BuildStatus::Cancelling => {
+                        if let Err(err) = self.control.cancel_active(&build_id) {
+                            errors.push(err);
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => errors.push(format!("active build {build_id} disappeared")),
+                    Err(err) => {
+                        errors.push(err);
+                        if let Err(err) = self.control.cancel_active(&build_id) {
+                            errors.push(err);
+                        }
+                    }
+                }
+            }
+        }
+
+        for worker in self.workers {
+            if worker.join().is_err() {
+                errors.push("worker thread panicked".to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
 pub fn start_worker(
     store: Arc<Mutex<DatabaseStore>>,
     data_dir: PathBuf,
     control: WorkerControl,
-) -> Result<(), String> {
-    thread::Builder::new()
-        .name("renkins-worker".to_string())
-        .spawn(move || {
-            loop {
-                match run_one_build_with_control(&store, &data_dir, &control) {
-                    Ok(true) => {}
-                    Ok(false) => thread::sleep(POLL_INTERVAL),
-                    Err(err) => {
-                        eprintln!("worker iteration failed: {err}");
-                        thread::sleep(POLL_INTERVAL);
+) -> Result<WorkerHandle, String> {
+    start_worker_pool(store, data_dir, control, 1)
+}
+
+pub fn start_worker_pool(
+    store: Arc<Mutex<DatabaseStore>>,
+    data_dir: PathBuf,
+    control: WorkerControl,
+    concurrency: usize,
+) -> Result<WorkerHandle, String> {
+    if !(1..=MAX_CONCURRENT_BUILDS).contains(&concurrency) {
+        return Err(format!(
+            "worker concurrency must be between 1 and {MAX_CONCURRENT_BUILDS}"
+        ));
+    }
+    let mut workers = Vec::with_capacity(concurrency);
+    for index in 0..concurrency {
+        let worker_store = Arc::clone(&store);
+        let data_dir = data_dir.clone();
+        let worker_control = control.clone();
+        let worker = thread::Builder::new()
+            .name(format!("renkins-worker-{index}"))
+            .spawn(move || {
+                loop {
+                    if worker_control.shutdown_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match run_one_build_with_control(&worker_store, &data_dir, &worker_control) {
+                        Ok(true) => {}
+                        Ok(false) if worker_control.shutdown_requested.load(Ordering::Acquire) => {
+                            break;
+                        }
+                        Ok(false) => thread::sleep(POLL_INTERVAL),
+                        Err(err) => {
+                            eprintln!("worker iteration failed: {err}");
+                            thread::sleep(POLL_INTERVAL);
+                        }
                     }
                 }
+            });
+        match worker {
+            Ok(worker) => workers.push(worker),
+            Err(err) => {
+                let partial = WorkerHandle {
+                    store: Arc::clone(&store),
+                    control,
+                    workers,
+                };
+                let shutdown = partial.shutdown(Duration::ZERO);
+                return match shutdown {
+                    Ok(()) => Err(format!("failed to start build worker thread: {err}")),
+                    Err(shutdown_err) => Err(format!(
+                        "failed to start build worker thread: {err}; cleanup failed: {shutdown_err}"
+                    )),
+                };
             }
-        })
-        .map(|_| ())
-        .map_err(|err| format!("failed to start build worker thread: {err}"))
+        }
+    }
+    Ok(WorkerHandle {
+        store,
+        control,
+        workers,
+    })
 }
 
 pub fn run_one_build(store: &Arc<Mutex<DatabaseStore>>, data_dir: &Path) -> Result<bool, String> {
@@ -102,17 +249,24 @@ pub fn run_one_build_with_control(
     data_dir: &Path,
     control: &WorkerControl,
 ) -> Result<bool, String> {
-    let build = {
+    let (build, active) = {
+        let _claim_gate = control
+            .claim_gate
+            .lock()
+            .map_err(|_| "worker claim gate is poisoned".to_string())?;
+        if control.shutdown_requested.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let mut store = store
             .lock()
             .map_err(|_| "database store lock is poisoned".to_string())?;
-        store.claim_next_build()?
-    };
-    let Some(build) = build else {
-        return Ok(false);
+        let Some(build) = store.claim_next_build()? else {
+            return Ok(false);
+        };
+        let active = control.register(&build.id)?;
+        (build, active)
     };
 
-    let active = control.register(&build.id)?;
     if cancellation_is_requested(store, &build, &active.cancellation_requested)? {
         finish_cancelled(store, &build, data_dir)?;
         return Ok(true);
@@ -559,6 +713,26 @@ mod tests {
         (dir, Arc::new(Mutex::new(db)))
     }
 
+    fn wait_for_status(
+        store: &Arc<Mutex<DatabaseStore>>,
+        build_id: &str,
+        status: BuildStatus,
+    ) -> Build {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let build = store.lock().unwrap().get_build(build_id).unwrap().unwrap();
+            if build.status == status {
+                return build;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "build {build_id} did not reach {status:?}; last status: {:?}",
+                build.status
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn claims_checks_out_executes_and_persists_build_results() {
         let pipeline = r#"
@@ -705,7 +879,7 @@ steps:
         let cancellation = store
             .lock()
             .unwrap()
-            .request_build_cancellation("build-1")
+            .request_build_cancellation("build-1", BuildCancellationReason::User)
             .unwrap()
             .unwrap();
         assert_eq!(cancellation.status, BuildStatus::Cancelling);
@@ -716,5 +890,125 @@ steps:
         assert_eq!(build.status, BuildStatus::Cancelled);
         let steps = store.lock().unwrap().get_build_steps("build-1").unwrap();
         assert_eq!(steps[0].status, "cancelled");
+    }
+
+    #[test]
+    fn worker_pool_respects_a_single_build_concurrency_limit() {
+        let pipeline = "version: 1\nsteps:\n  - name: wait\n    run: sleep 0.15\n";
+        let (dir, store) = fixture(pipeline);
+        store
+            .lock()
+            .unwrap()
+            .enqueue_build("build-2", "job-1", "refs/heads/main")
+            .unwrap();
+        let worker = start_worker_pool(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            WorkerControl::default(),
+            1,
+        )
+        .unwrap();
+
+        wait_for_status(&store, "build-2", BuildStatus::Succeeded);
+        worker.shutdown(Duration::from_secs(1)).unwrap();
+
+        let store = store.lock().unwrap();
+        let first = store.get_build_steps("build-1").unwrap().remove(0);
+        let second = store.get_build_steps("build-2").unwrap().remove(0);
+        assert!(
+            first
+                .finished_at
+                .zip(second.started_at)
+                .is_some_and(|(first_finished, second_started)| second_started >= first_finished)
+        );
+    }
+
+    #[test]
+    fn worker_pool_runs_builds_concurrently_when_multiple_slots_are_configured() {
+        let (dir, store) = fixture("version: 1\nsteps:\n  - name: wait\n    run: sleep 0.5\n");
+        store
+            .lock()
+            .unwrap()
+            .enqueue_build("build-2", "job-1", "refs/heads/main")
+            .unwrap();
+        let worker = start_worker_pool(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            WorkerControl::default(),
+            2,
+        )
+        .unwrap();
+
+        wait_for_status(&store, "build-2", BuildStatus::Succeeded);
+        worker.shutdown(Duration::from_secs(1)).unwrap();
+
+        let store = store.lock().unwrap();
+        let first = store.get_build_steps("build-1").unwrap().remove(0);
+        let second = store.get_build_steps("build-2").unwrap().remove(0);
+        assert!(
+            first
+                .started_at
+                .zip(first.finished_at)
+                .zip(second.started_at.zip(second.finished_at))
+                .is_some_and(
+                    |((first_started, first_finished), (second_started, second_finished))| {
+                        first_started < second_finished && second_started < first_finished
+                    }
+                )
+        );
+    }
+
+    #[test]
+    fn worker_shutdown_allows_active_builds_to_finish_within_grace() {
+        let (dir, store) = fixture("version: 1\nsteps:\n  - name: wait\n    run: sleep 0.1\n");
+        let worker = start_worker_pool(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            WorkerControl::default(),
+            1,
+        )
+        .unwrap();
+        wait_for_status(&store, "build-1", BuildStatus::Running);
+
+        worker.shutdown(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_build("build-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            BuildStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn worker_shutdown_cancels_after_grace_and_leaves_queued_work_unclaimed() {
+        let (dir, store) = fixture("version: 1\nsteps:\n  - name: wait\n    run: sleep 10\n");
+        store
+            .lock()
+            .unwrap()
+            .enqueue_build("build-2", "job-1", "refs/heads/main")
+            .unwrap();
+        let worker = start_worker_pool(
+            Arc::clone(&store),
+            dir.path().to_path_buf(),
+            WorkerControl::default(),
+            1,
+        )
+        .unwrap();
+        wait_for_status(&store, "build-1", BuildStatus::Running);
+
+        worker.shutdown(Duration::from_millis(50)).unwrap();
+        let store = store.lock().unwrap();
+        let cancelled = store.get_build("build-1").unwrap().unwrap();
+        assert_eq!(cancelled.status, BuildStatus::Cancelled);
+        assert_eq!(cancelled.cancel_reason.as_deref(), Some("server_shutdown"));
+        assert!(cancelled.cancel_requested_at.is_some());
+        assert_eq!(
+            store.get_build("build-2").unwrap().unwrap().status,
+            BuildStatus::Queued
+        );
     }
 }

@@ -1,12 +1,23 @@
 # Development Progress
 
+## Latest handoff: worker concurrency and graceful shutdown
+
+The server now uses a bounded worker pool configured with `max_concurrent_builds` (default 1, maximum 32) and `shutdown_grace_seconds` (default 30, maximum 3600):
+
+- Worker claims are serialized with shutdown startup so no queued build can be claimed after shutdown begins; each claim still uses the durable SQLite transaction.
+- Ctrl-C and SIGTERM stop accepting requests and stop new worker claims. Active builds get the configured grace period to finish; remaining active builds are cancelled with reason `server_shutdown`, their process groups are terminated, and queued builds remain queued.
+- Worker threads are joined on shutdown and also cleaned up if pool startup fails partway through.
+- Added worker setting validation and tests for one-slot serialization, multi-slot parallel execution, graceful completion, forced cancellation, and preserving queued work.
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (63 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (62 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+
 ## Latest handoff: build and step timing
 
 Build and step timing is persisted and included in build API responses:
 
 - Build history and detail responses expose creation, claim/start, and finish timestamps as UTC Unix milliseconds, plus the elapsed duration for completed builds.
 - Each persisted step outcome includes a start timestamp (null if execution never started), finish timestamp, and duration.
-- A new schema migration adds the step start timestamp; prior databases migrate forward.
+- Schema migrations 6 and 7 add step start timestamps and cancellation reason metadata; prior databases migrate forward.
 - Build-detail API and worker tests verify the persisted timing fields and duration calculations.
 - Validation passed: `cargo fmt --check`, `cargo test --all-targets` (58 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
 
@@ -68,10 +79,10 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-The worker is currently a single polling loop with no configured concurrency or graceful shutdown. Readiness does not reflect worker state. Next roadmap slice: configurable worker concurrency and graceful shutdown, scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement also remain outstanding.
+Readiness does not reflect worker state. Next roadmap slice: scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement also remain outstanding.
 
 ## Continuation and commits
 
 - Keep the main branch compiling and tested after each logical implementation step.
 - Commit each independently completed implementation step with its tests and directly related documentation.
-- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 6. Server startup invokes persisted recovery; job/build APIs and the single worker use SQLite, while framed logs are stored on the filesystem. This remains partial coverage of Phase 6, not completion of the scheduler.
+- Same-process-group cleanup does not contain deliberately detached daemons. SQLite schema version is 7. Server startup invokes persisted recovery; job/build APIs and the worker pool use SQLite, while framed logs are stored on the filesystem. This remains partial coverage of Phase 6, not completion of the scheduler.
