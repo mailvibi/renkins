@@ -1,5 +1,11 @@
 # Development Progress
 
+## Latest handoff: Git credential boundaries
+
+Repository URLs now accept public HTTPS or `git@host:path` syntax only, rejecting embedded user-info, query strings, fragments, malformed hosts, and empty SSH paths. Git disables system/global configuration and interactive prompts; SSH is forced to use batch mode and strict host-key checking. README guidance covers operator-provisioned read-only SSH identities, pinned `known_hosts`, and the fact that pipeline code shares the service account's key/agent authority and is not sandboxed. `HOME` remains inherited for SSH config and known-hosts lookup.
+
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (68 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+
 ## Latest handoff: data-directory ownership and locking
 
 Server startup now refuses root execution, canonicalizes and permission-hardens the data directory, verifies service-account ownership, and holds a nonblocking exclusive `flock` for the server lifetime. The configured token file must resolve to a regular non-symlink file under the canonical data directory; database, logs, and workspaces are rooted there. Added coverage for lock contention/release, restrictive permissions, root rejection, and path escapes.
@@ -21,7 +27,6 @@ The server now uses a bounded worker pool configured with `max_concurrent_builds
 - Worker threads are joined on shutdown and also cleaned up if pool startup fails partway through.
 - Added worker setting validation and tests for one-slot serialization, multi-slot parallel execution, graceful completion, forced cancellation, and preserving queued work.
 - Validation passed: `cargo fmt --check`, `cargo test --all-targets` (63 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
-- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (62 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
 
 ## Latest handoff: build and step timing
 
@@ -91,7 +96,7 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-Next roadmap slice: Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement remain outstanding.
+Next roadmap slice: startup log scanning/recovery markers, persistent integrity state, and output-size enforcement. Additional API/CLI/UI and release-readiness work remains as listed in `PLAN.md`.
 
 ## Continuation and commits
 

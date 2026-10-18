@@ -45,13 +45,40 @@ pub fn validate_name(name: &str) -> Result<(), ApiError> {
 }
 
 pub fn validate_repository_url(url: &str) -> Result<(), ApiError> {
-    if !url.starts_with("https://") && !url.starts_with("git@") {
+    let valid_https = url.strip_prefix("https://").is_some_and(|remainder| {
+        let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+        valid_repository_host(authority)
+            && !authority.contains('@')
+            && !remainder.contains(['?', '#'])
+            && !url.chars().any(char::is_whitespace)
+    });
+    let valid_ssh = url
+        .strip_prefix("git@")
+        .and_then(|remainder| remainder.split_once(':'))
+        .is_some_and(|(host, path)| {
+            valid_repository_host(host)
+                && !path.is_empty()
+                && !path.contains(['?', '#'])
+                && !url.chars().any(char::is_whitespace)
+        });
+    if !valid_https && !valid_ssh {
         return Err(ApiError {
             code: "invalid_repository_url",
-            message: "repository_url must be https or SSH-style git@".to_string(),
+            message:
+                "repository_url must be public HTTPS or git@host:path without embedded credentials"
+                    .to_string(),
         });
     }
     Ok(())
+}
+
+fn valid_repository_host(host: &str) -> bool {
+    !host.is_empty()
+        && host != "."
+        && !host.starts_with(':')
+        && !host
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '@' | '/' | '\\'))
 }
 
 pub fn validate_build_ref(reference: Option<&str>) -> Result<Option<String>, ApiError> {
@@ -140,6 +167,13 @@ mod tests {
 
         assert!(validate_build_ref(Some("main")).is_err());
         assert!(validate_build_ref(Some("refs/heads/main")).is_ok());
+        assert!(validate_repository_url("git@github.com:owner/repo.git").is_ok());
+        assert!(validate_repository_url("https://github.com/owner/repo.git").is_ok());
+        assert!(
+            validate_repository_url("https://user:password@github.com/owner/repo.git").is_err()
+        );
+        assert!(validate_repository_url("https://?token=secret").is_err());
+        assert!(validate_repository_url("git@github.com:").is_err());
     }
 
     #[test]

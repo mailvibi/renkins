@@ -28,6 +28,24 @@ cargo test --all-targets
 cargo run -- --help
 ```
 
+## Git credentials for operators
+
+Use public HTTPS repository URLs without embedded credentials, or SSH-style URLs such as `git@github.com:owner/repository.git`. Renkins rejects URL user-info, query strings, and fragments; do not put passwords, access tokens, or other credentials in a repository URL, job request, or `.renkins.yml`. Private HTTPS repositories that require an HTTP credential are not supported.
+
+For private repositories, provision a dedicated read-only SSH deploy identity for the Renkins service account, scoped to only the required repository or repositories. Pre-populate that account's `known_hosts` from a trusted source. For example, its `~/.ssh/config` can select the key and known-hosts file:
+
+```sshconfig
+Host github.com
+  User git
+  IdentityFile /etc/renkins/ssh/repository-readonly
+  IdentitiesOnly yes
+  UserKnownHostsFile /etc/renkins/ssh/known_hosts
+```
+
+Protect the private key, SSH configuration, and `known_hosts` with service-account-only filesystem permissions. Git prompts are disabled; SSH is forced into batch mode and strict host-key checking. The daemon does not provide a credential-injection mechanism. It disables system and global Git configuration, but uses the service account's `HOME` for SSH configuration and known hosts; operators must provision these files correctly.
+
+Repository checkout and pipeline commands run as the same service account. Pipeline code can therefore access that account's SSH key and any available SSH agent, so neither a dedicated deploy key nor omission of `SSH_AUTH_SOCK` from the step environment isolates credentials from repository code. Only run trusted repositories; this is not a sandbox.
+
 ## Trust model and current limitations
 
 This is not a Jenkins-compatible replacement. It is intentionally limited to a single-node, localhost-first CI flow with a dedicated service account and minimal execution surface. Commands run as that service account, not in a security sandbox. Git clone is limited to five minutes and other Git operations to thirty seconds; timed-out Git children are terminated with their process groups. The step executor likewise terminates children in its process group, but deliberately detached processes are outside that cleanup guarantee and are unsupported.
