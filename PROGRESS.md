@@ -1,8 +1,14 @@
 # Development Progress
 
+## Latest handoff: data-directory ownership and locking
+
+Server startup now refuses root execution, canonicalizes and permission-hardens the data directory, verifies service-account ownership, and holds a nonblocking exclusive `flock` for the server lifetime. The configured token file must resolve to a regular non-symlink file under the canonical data directory; database, logs, and workspaces are rooted there. Added coverage for lock contention/release, restrictive permissions, root rejection, and path escapes.
+
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (68 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+
 ## Latest handoff: scheduler-aware readiness
 
-`/readyz` is now separate from `/healthz` and reports readiness only when the current SQLite schema/query path is available and the bounded worker pool has started. It returns `503` before scheduler startup or after shutdown begins. Database readiness failures are logged without exposing internal details in the HTTP response.
+`/readyz` is now separate from `/healthz` and reports readiness only when the data-directory lock is held, the current SQLite schema/query path is available, and the bounded worker pool has started. It returns `503` before scheduler startup or after shutdown begins. Database readiness failures are logged without exposing internal details in the HTTP response.
 
 - Validation passed: `cargo fmt --check`, `cargo test --all-targets` (65 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
 
@@ -85,7 +91,7 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-Readiness does not reflect worker state. Next roadmap slice: scheduler-aware readiness, data-directory ownership locking/root rejection, and Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement also remain outstanding.
+Next roadmap slice: Git credential/operator documentation. Startup log scanning/recovery markers, persistent integrity state, and output-size enforcement remain outstanding.
 
 ## Continuation and commits
 

@@ -15,6 +15,7 @@ use crate::api::{
     BuildEnqueueRequest, JobCreateRequest, JobResponse, create_job, validate_build_ref,
 };
 use crate::config::{ServerConfig, read_or_create_token_file, validate_token_header};
+use crate::data_dir::{DataDirectoryLock, resolve_file_under_data_dir};
 use crate::domain::{Build, BuildCancellationReason, BuildStatus, Job};
 use crate::logs::{ReadLogError, read_page};
 use crate::storage::{DatabaseStore, EnqueueBuildError};
@@ -26,6 +27,7 @@ pub struct AppState {
     store: Arc<Mutex<DatabaseStore>>,
     logs_dir: PathBuf,
     worker_control: WorkerControl,
+    data_directory_locked: bool,
 }
 
 pub fn build_router(expected_token: &str) -> Result<Router, String> {
@@ -46,6 +48,7 @@ pub fn build_router_with_store(expected_token: &str, store: DatabaseStore) -> Ro
         Arc::new(Mutex::new(store)),
         logs_dir,
         WorkerControl::default(),
+        false,
     )
 }
 
@@ -54,6 +57,7 @@ fn build_router_with_shared_store(
     store: Arc<Mutex<DatabaseStore>>,
     logs_dir: PathBuf,
     worker_control: WorkerControl,
+    data_directory_locked: bool,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthcheck))
@@ -75,14 +79,18 @@ fn build_router_with_shared_store(
             store,
             logs_dir,
             worker_control,
+            data_directory_locked,
         })
 }
 
 pub async fn serve(config: &ServerConfig) -> Result<(), String> {
-    let token = read_or_create_token_file(&config.auth_token_file)
+    let data_directory_lock = DataDirectoryLock::acquire(&config.data_dir)?;
+    let data_dir = data_directory_lock.path().to_path_buf();
+    let token_file = resolve_file_under_data_dir(&data_dir, &config.auth_token_file)?;
+    let token = read_or_create_token_file(&token_file)
         .map_err(|err| format!("failed to initialize auth token: {err}"))?;
 
-    let database_path = Path::new(&config.data_dir).join("renkins.sqlite3");
+    let database_path = data_dir.join("renkins.sqlite3");
     let mut store = DatabaseStore::open(&database_path)?;
     store.initialize_schema()?;
     store.recover_abandoned_builds()?;
@@ -93,15 +101,16 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
     let worker_control = WorkerControl::default();
     let worker = crate::worker::start_worker_pool(
         Arc::clone(&store),
-        Path::new(&config.data_dir).to_path_buf(),
+        data_dir.clone(),
         worker_control.clone(),
         config.max_concurrent_builds,
     )?;
     let router = build_router_with_shared_store(
         &token,
         store,
-        Path::new(&config.data_dir).join("logs"),
+        data_dir.join("logs"),
         worker_control.clone(),
+        true,
     );
     let signal_control = worker_control;
     let server_result = axum::serve(listener, router)
@@ -171,7 +180,7 @@ async fn healthcheck() -> StatusCode {
 }
 
 async fn readycheck(State(state): State<AppState>) -> StatusCode {
-    if !state.worker_control.is_ready() {
+    if !state.data_directory_locked || !state.worker_control.is_ready() {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     match state.store.lock() {
@@ -791,11 +800,13 @@ mod tests {
         let store = Arc::new(Mutex::new(store));
         let control = WorkerControl::default();
         let dir = tempdir().unwrap();
+        let _data_directory_lock = DataDirectoryLock::acquire(dir.path().join("data")).unwrap();
         let app = build_router_with_shared_store(
             "secret-token",
             Arc::clone(&store),
             dir.path().join("logs"),
             control.clone(),
+            true,
         );
         let ready_request = || {
             Request::builder()

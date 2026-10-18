@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod data_dir;
 pub mod domain;
 pub mod executor;
 pub mod git;
