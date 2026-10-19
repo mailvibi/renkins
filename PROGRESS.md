@@ -1,5 +1,11 @@
 # Development Progress
 
+## Latest handoff: per-build output limits
+
+Added validated `max_build_output_bytes` server configuration (10 MiB default, 1 byte to 1 GiB). The executor counts combined stdout/stderr across all steps, preserves no more than the configured raw-output bytes, and terminates the process group as soon as additional output is observed. The worker persists the explicit `log_limit` failure and appends a truncation marker; existing worker entry points keep their default behavior. README documents the limit and what it measures.
+
+- Validation passed: `cargo fmt --check`, `cargo test --all-targets` (71 tests), `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+
 ## Latest handoff: startup log recovery and integrity
 
 Startup now scans retained `.rkl` logs after interrupted builds are marked and before readiness or worker startup. Incomplete final records are truncated and synced; interior corruption is preserved and persisted as `corrupt`; recoverable interrupted builds receive a recovery marker after the valid prefix. Marker work is tracked in SQLite so normal restarts do not append duplicates, and the logs API persists integrity changes it detects, including expired logs. Schema version is now 8.
@@ -102,7 +108,7 @@ The earlier server fix in `src/server.rs` changed the captured route segment to 
 
 The project plan and README are the source of truth for intended behavior. No full roadmap phase is declared complete here.
 
-Next roadmap slice: enforce per-build output-size limits with an explicit failure and truncation marker. Additional API/CLI/UI and release-readiness work remains as listed in `PLAN.md`.
+Next roadmap slice: continue the remaining API/CLI/UI and release-readiness work in `PLAN.md`, including backup/restore, retention, end-to-end restart testing, and operator setup.
 
 ## Continuation and commits
 

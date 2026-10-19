@@ -1,4 +1,6 @@
-use crate::config::MAX_CONCURRENT_BUILDS;
+use crate::config::{
+    DEFAULT_MAX_BUILD_OUTPUT_BYTES, MAX_BUILD_OUTPUT_BYTES, MAX_CONCURRENT_BUILDS,
+};
 use crate::domain::{Build, BuildCancellationReason, BuildStatus};
 use crate::executor::{self, StepStatus};
 use crate::git;
@@ -201,6 +203,27 @@ pub fn start_worker_pool(
     control: WorkerControl,
     concurrency: usize,
 ) -> Result<WorkerHandle, String> {
+    start_worker_pool_with_output_limit(
+        store,
+        data_dir,
+        control,
+        concurrency,
+        DEFAULT_MAX_BUILD_OUTPUT_BYTES,
+    )
+}
+
+pub fn start_worker_pool_with_output_limit(
+    store: Arc<Mutex<DatabaseStore>>,
+    data_dir: PathBuf,
+    control: WorkerControl,
+    concurrency: usize,
+    max_build_output_bytes: u64,
+) -> Result<WorkerHandle, String> {
+    if !(1..=MAX_BUILD_OUTPUT_BYTES).contains(&max_build_output_bytes) {
+        return Err(format!(
+            "max_build_output_bytes must be between 1 and {MAX_BUILD_OUTPUT_BYTES}"
+        ));
+    }
     if !(1..=MAX_CONCURRENT_BUILDS).contains(&concurrency) {
         return Err(format!(
             "worker concurrency must be between 1 and {MAX_CONCURRENT_BUILDS}"
@@ -222,7 +245,12 @@ pub fn start_worker_pool(
                     if worker_control.shutdown_requested.load(Ordering::Acquire) {
                         break;
                     }
-                    match run_one_build_with_control(&worker_store, &data_dir, &worker_control) {
+                    match run_one_build_with_output_limit(
+                        &worker_store,
+                        &data_dir,
+                        &worker_control,
+                        max_build_output_bytes,
+                    ) {
                         Ok(true) => {}
                         Ok(false) if worker_control.shutdown_requested.load(Ordering::Acquire) => {
                             break;
@@ -269,6 +297,15 @@ pub fn run_one_build_with_control(
     data_dir: &Path,
     control: &WorkerControl,
 ) -> Result<bool, String> {
+    run_one_build_with_output_limit(store, data_dir, control, DEFAULT_MAX_BUILD_OUTPUT_BYTES)
+}
+
+pub(crate) fn run_one_build_with_output_limit(
+    store: &Arc<Mutex<DatabaseStore>>,
+    data_dir: &Path,
+    control: &WorkerControl,
+    max_build_output_bytes: u64,
+) -> Result<bool, String> {
     let (build, active) = {
         let _claim_gate = control
             .claim_gate
@@ -291,7 +328,13 @@ pub fn run_one_build_with_control(
         finish_cancelled(store, &build, data_dir)?;
         return Ok(true);
     }
-    process_build(store, data_dir, build, &active.cancellation_requested)?;
+    process_build(
+        store,
+        data_dir,
+        build,
+        &active.cancellation_requested,
+        max_build_output_bytes,
+    )?;
     Ok(true)
 }
 
@@ -300,6 +343,7 @@ fn process_build(
     data_dir: &Path,
     build: Build,
     cancellation_requested: &AtomicBool,
+    max_build_output_bytes: u64,
 ) -> Result<(), String> {
     let job = {
         let store = store
@@ -458,12 +502,13 @@ fn process_build(
     let timeout_seconds = pipeline
         .timeout_minutes
         .map(|minutes| minutes.saturating_mul(60));
-    let outcomes = match executor::execute_pipeline_with_cancellation(
+    let outcomes = match executor::execute_pipeline_with_output_limit(
         &checkout.workspace,
         &pipeline.steps,
         &log_path,
         timeout_seconds,
         cancellation_requested,
+        max_build_output_bytes,
     ) {
         Ok(outcomes) => outcomes,
         Err(err) => {
@@ -485,6 +530,7 @@ fn process_build(
                 StepStatus::Failed => "failed",
                 StepStatus::TimedOut => "timed_out",
                 StepStatus::Cancelled => "cancelled",
+                StepStatus::OutputLimitExceeded => "failed",
             };
             StepOutcomeRecord {
                 step_index: index,
@@ -514,9 +560,15 @@ fn process_build(
         };
     }
 
-    let failed = outcomes
+    let output_limit_exceeded = outcomes
         .iter()
-        .any(|outcome| matches!(outcome.status, StepStatus::Failed | StepStatus::TimedOut));
+        .any(|outcome| outcome.status == StepStatus::OutputLimitExceeded);
+    let failed = outcomes.iter().any(|outcome| {
+        matches!(
+            outcome.status,
+            StepStatus::Failed | StepStatus::TimedOut | StepStatus::OutputLimitExceeded
+        )
+    });
     let cancelled = outcomes
         .iter()
         .any(|outcome| outcome.status == StepStatus::Cancelled);
@@ -526,7 +578,9 @@ fn process_build(
             .any(|outcome| outcome.status == StepStatus::TimedOut);
         (
             BuildStatus::Failed,
-            Some(if timed_out {
+            Some(if output_limit_exceeded {
+                "log_limit"
+            } else if timed_out {
                 "step_timed_out"
             } else {
                 "step_failed"
@@ -546,9 +600,12 @@ fn process_build(
         failure_kind,
     )?;
 
+    let output_limit_failed = output_limit_exceeded && terminal == BuildStatus::Failed;
     append_log(
         &log_path,
-        if terminal == BuildStatus::Cancelled {
+        if output_limit_failed {
+            "[build] output limit exceeded; remaining output truncated"
+        } else if terminal == BuildStatus::Cancelled {
             "[build] cancelled"
         } else if failed {
             "[build] failed"
@@ -812,6 +869,48 @@ steps:
                 .iter()
                 .any(|record| record.stream == "stdout" && record.payload == b"done")
         );
+    }
+
+    #[test]
+    fn output_limit_fails_build_and_records_truncation_marker() {
+        let (dir, store) = fixture(
+            "version: 1\nsteps:\n  - name: large-output\n    run: head -c 100000 /dev/zero\n",
+        );
+
+        assert!(
+            run_one_build_with_output_limit(&store, dir.path(), &WorkerControl::default(), 2048,)
+                .unwrap()
+        );
+
+        let store = store.lock().unwrap();
+        assert_eq!(
+            store.get_build("build-1").unwrap().unwrap().status,
+            BuildStatus::Failed
+        );
+        assert_eq!(
+            store.get_build_failure_kind("build-1").unwrap().as_deref(),
+            Some("log_limit")
+        );
+        let steps = store.get_build_steps("build-1").unwrap();
+        assert_eq!(steps[0].status, "failed");
+        assert!(steps[0].started_at.is_some());
+        drop(store);
+
+        let page = crate::logs::read_page(&dir.path().join("logs/build-1.rkl"), None, 100, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.records
+                .iter()
+                .filter(|record| record.stream == "stdout" || record.stream == "stderr")
+                .map(|record| record.payload.len())
+                .sum::<usize>(),
+            2048
+        );
+        assert!(page.records.iter().any(|record| {
+            record.stream == "build"
+                && record.payload == b"[build] output limit exceeded; remaining output truncated\n"
+        }));
     }
 
     #[test]

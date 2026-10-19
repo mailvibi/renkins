@@ -257,6 +257,18 @@ impl DatabaseStore {
             .map_err(|err| format!("failed to get build: {err}"))
     }
 
+    pub fn get_build_failure_kind(&self, id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT failure_kind FROM builds WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(|err| format!("failed to get build failure kind: {err}"))
+    }
+
     pub fn request_build_cancellation(
         &mut self,
         id: &str,

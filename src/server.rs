@@ -101,11 +101,12 @@ pub async fn serve(config: &ServerConfig) -> Result<(), String> {
         .await
         .map_err(|err| format!("failed to bind {}: {err}", config.listen))?;
     let worker_control = WorkerControl::default();
-    let worker = crate::worker::start_worker_pool(
+    let worker = crate::worker::start_worker_pool_with_output_limit(
         Arc::clone(&store),
         data_dir.clone(),
         worker_control.clone(),
         config.max_concurrent_builds,
+        config.max_build_output_bytes,
     )?;
     let router = build_router_with_shared_store(
         &token,
@@ -425,6 +426,9 @@ async fn get_build_route(
     let resolved_commit = store
         .get_resolved_commit(&build_id)
         .map_err(|_| internal_error_response())?;
+    let failure_kind = store
+        .get_build_failure_kind(&build_id)
+        .map_err(|_| internal_error_response())?;
     Ok(Json(json!({
         "id": build.id,
         "job_id": build.job_id,
@@ -438,6 +442,7 @@ async fn get_build_route(
         "duration_ms": duration_ms(build.started_at, build.finished_at),
         "cancel_requested_at_ms": build.cancel_requested_at,
         "cancel_reason": build.cancel_reason,
+        "failure_kind": failure_kind,
         "pipeline": snapshot,
         "steps": steps
     }))
@@ -1425,8 +1430,8 @@ mod tests {
                 "build-1",
                 &[StepOutcomeRecord {
                     step_index: 0,
-                    status: "succeeded",
-                    exit_code: Some(0),
+                    status: "failed",
+                    exit_code: None,
                     started_at: Some(111),
                     finished_at: 222,
                 }],
@@ -1434,7 +1439,12 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .transition_build("build-1", BuildStatus::Running, BuildStatus::Succeeded)
+                .transition_build_with_failure(
+                    "build-1",
+                    BuildStatus::Running,
+                    BuildStatus::Failed,
+                    Some("log_limit"),
+                )
                 .unwrap()
         );
         let app = build_router_with_store("secret-token", store);
@@ -1452,6 +1462,8 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(response["created_at_ms"].is_number());
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["failure_kind"], "log_limit");
         assert!(response["started_at_ms"].is_number());
         assert!(response["finished_at_ms"].is_number());
         assert_eq!(
@@ -1459,6 +1471,7 @@ mod tests {
             response["finished_at_ms"].as_i64().unwrap()
                 - response["started_at_ms"].as_i64().unwrap()
         );
+        assert_eq!(response["steps"][0]["status"], "failed");
         assert_eq!(response["steps"][0]["started_at_ms"], 111);
         assert_eq!(response["steps"][0]["finished_at_ms"], 222);
         assert_eq!(response["steps"][0]["duration_ms"], 111);

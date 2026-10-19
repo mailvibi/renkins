@@ -11,6 +11,7 @@ Renkins is a Rust-based single-node CI engine prototype inspired by the first-re
 - Git clone/checkout commands run without interactive prompts, have bounded execution time, and terminate their process groups on timeout
 - Ordered shell step execution with timeout handling and append-only log output
 - Bounded durable worker pool with configurable concurrency and graceful shutdown
+- Configurable combined build-output limit that terminates noisy builds and records an explicit failure
 - Restart recovery for interrupted builds and queued work
 - Separate public liveness and readiness endpoints; readiness checks the data-directory lock, database schema/query path, and worker-pool startup state
 - API request validation for job creation, build enqueue, and log retrieval
@@ -45,6 +46,10 @@ Host github.com
 Protect the private key, SSH configuration, and `known_hosts` with service-account-only filesystem permissions. Git prompts are disabled; SSH is forced into batch mode and strict host-key checking. The daemon does not provide a credential-injection mechanism. It disables system and global Git configuration, but uses the service account's `HOME` for SSH configuration and known hosts; operators must provision these files correctly.
 
 Repository checkout and pipeline commands run as the same service account. Pipeline code can therefore access that account's SSH key and any available SSH agent, so neither a dedicated deploy key nor omission of `SSH_AUTH_SOCK` from the step environment isolates credentials from repository code. Only run trusted repositories; this is not a sandbox.
+
+## Build output limit
+
+Set `max_build_output_bytes` in the server TOML configuration to limit the combined raw stdout and stderr recorded from all steps in one build. It defaults to 10 MiB and accepts values from 1 byte through 1 GiB. When a process produces output beyond the limit, Renkins terminates its process group, retains at most the configured number of output bytes, marks the build failed with `failure_kind=log_limit`, and appends a truncation marker when log writes remain available. Framing and build-status records are not counted toward this raw process-output limit.
 
 ## Trust model and current limitations
 

@@ -7,6 +7,8 @@ pub const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 1;
 pub const MAX_CONCURRENT_BUILDS: usize = 32;
 pub const DEFAULT_SHUTDOWN_GRACE_SECONDS: u64 = 30;
 pub const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 3_600;
+pub const DEFAULT_MAX_BUILD_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_BUILD_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -18,6 +20,7 @@ pub struct ServerConfig {
     pub auth_token_file: String,
     pub max_concurrent_builds: usize,
     pub shutdown_grace_seconds: u64,
+    pub max_build_output_bytes: u64,
 }
 
 impl ServerConfig {
@@ -44,6 +47,7 @@ impl ServerConfig {
             auth_token_file,
             max_concurrent_builds: DEFAULT_MAX_CONCURRENT_BUILDS,
             shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
+            max_build_output_bytes: DEFAULT_MAX_BUILD_OUTPUT_BYTES,
         })
     }
 
@@ -66,6 +70,19 @@ impl ServerConfig {
         self.shutdown_grace_seconds = shutdown_grace_seconds;
         Ok(self)
     }
+
+    pub fn with_max_build_output_bytes(
+        mut self,
+        max_build_output_bytes: u64,
+    ) -> Result<Self, String> {
+        if !(1..=MAX_BUILD_OUTPUT_BYTES).contains(&max_build_output_bytes) {
+            return Err(format!(
+                "max_build_output_bytes must be between 1 and {MAX_BUILD_OUTPUT_BYTES}"
+            ));
+        }
+        self.max_build_output_bytes = max_build_output_bytes;
+        Ok(self)
+    }
 }
 
 pub fn parse_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig, String> {
@@ -84,13 +101,16 @@ pub fn parse_server_config_str(contents: &str) -> Result<ServerConfig, String> {
         max_concurrent_builds: usize,
         #[serde(default = "default_shutdown_grace_seconds")]
         shutdown_grace_seconds: u64,
+        #[serde(default = "default_max_build_output_bytes")]
+        max_build_output_bytes: u64,
     }
 
     let config: RawServerConfig =
         toml::from_str(contents).map_err(|err| format!("invalid server config: {err}"))?;
 
     ServerConfig::new(config.listen, config.data_dir, config.auth_token_file)?
-        .with_worker_settings(config.max_concurrent_builds, config.shutdown_grace_seconds)
+        .with_worker_settings(config.max_concurrent_builds, config.shutdown_grace_seconds)?
+        .with_max_build_output_bytes(config.max_build_output_bytes)
 }
 
 fn default_max_concurrent_builds() -> usize {
@@ -99,6 +119,10 @@ fn default_max_concurrent_builds() -> usize {
 
 fn default_shutdown_grace_seconds() -> u64 {
     DEFAULT_SHUTDOWN_GRACE_SECONDS
+}
+
+fn default_max_build_output_bytes() -> u64 {
+    DEFAULT_MAX_BUILD_OUTPUT_BYTES
 }
 
 pub fn parse_listen_address(value: &str) -> Result<String, String> {
@@ -278,6 +302,10 @@ mod tests {
             parsed.shutdown_grace_seconds,
             DEFAULT_SHUTDOWN_GRACE_SECONDS
         );
+        assert_eq!(
+            parsed.max_build_output_bytes,
+            DEFAULT_MAX_BUILD_OUTPUT_BYTES
+        );
     }
 
     #[test]
@@ -288,11 +316,13 @@ mod tests {
             auth_token_file = "./data/admin-token"
             max_concurrent_builds = 4
             shutdown_grace_seconds = 15
+            max_build_output_bytes = 2048
         "#;
 
         let parsed = parse_server_config_str(config).unwrap();
         assert_eq!(parsed.max_concurrent_builds, 4);
         assert_eq!(parsed.shutdown_grace_seconds, 15);
+        assert_eq!(parsed.max_build_output_bytes, 2048);
 
         assert!(
             ServerConfig::new("127.0.0.1:8080", "./data", "./data/token")
@@ -304,6 +334,18 @@ mod tests {
             ServerConfig::new("127.0.0.1:8080", "./data", "./data/token")
                 .unwrap()
                 .with_worker_settings(1, MAX_SHUTDOWN_GRACE_SECONDS + 1)
+                .is_err()
+        );
+        assert!(
+            ServerConfig::new("127.0.0.1:8080", "./data", "./data/token")
+                .unwrap()
+                .with_max_build_output_bytes(0)
+                .is_err()
+        );
+        assert!(
+            ServerConfig::new("127.0.0.1:8080", "./data", "./data/token")
+                .unwrap()
+                .with_max_build_output_bytes(MAX_BUILD_OUTPUT_BYTES + 1)
                 .is_err()
         );
     }

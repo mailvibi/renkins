@@ -2,7 +2,8 @@ use crate::logs::{BuildLog, LogStream, MAX_RECORD_PAYLOAD};
 use crate::pipeline::StepConfig;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{io, os::unix::process::CommandExt};
@@ -15,6 +16,7 @@ pub enum StepStatus {
     Failed,
     TimedOut,
     Cancelled,
+    OutputLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,11 +41,51 @@ pub enum ExecutorError {
     TimedOut,
 }
 
+#[derive(Clone)]
+struct OutputBudget {
+    bytes: Arc<AtomicU64>,
+    exceeded: Arc<AtomicBool>,
+    max_bytes: u64,
+}
+
+impl OutputBudget {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            bytes: Arc::new(AtomicU64::new(0)),
+            exceeded: Arc::new(AtomicBool::new(false)),
+            max_bytes,
+        }
+    }
+
+    fn reserve(&self, requested: usize) -> usize {
+        let requested = u64::try_from(requested).unwrap_or(u64::MAX);
+        let mut current = self.bytes.load(Ordering::Acquire);
+        loop {
+            let allowed = requested.min(self.max_bytes.saturating_sub(current));
+            match self.bytes.compare_exchange_weak(
+                current,
+                current + allowed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return usize::try_from(allowed).unwrap_or(usize::MAX),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+struct LogContext<'a> {
+    log: &'a BuildLog,
+    step_index: u32,
+}
+
 fn read_stream<R: std::io::Read + Send + 'static>(
     reader: R,
     log: BuildLog,
     step_index: u32,
     stream: LogStream,
+    output_budget: OutputBudget,
 ) -> thread::JoinHandle<Result<(), ExecutorError>> {
     thread::spawn(move || {
         let mut reader = reader;
@@ -55,8 +97,15 @@ fn read_stream<R: std::io::Read + Send + 'static>(
             if bytes == 0 {
                 break;
             }
-            log.append(Some(step_index), stream, &buffer[..bytes])
-                .map_err(ExecutorError::LogWriteFailed)?;
+            let written = output_budget.reserve(bytes);
+            if written > 0 {
+                log.append(Some(step_index), stream, &buffer[..written])
+                    .map_err(ExecutorError::LogWriteFailed)?;
+            }
+            if written < bytes {
+                output_budget.exceeded.store(true, Ordering::Release);
+                break;
+            }
         }
         Ok(())
     })
@@ -74,10 +123,13 @@ pub fn run_step(
         step,
         workspace,
         log_path,
-        &log,
-        0,
+        LogContext {
+            log: &log,
+            step_index: 0,
+        },
         timeout_seconds,
         &cancellation_requested,
+        OutputBudget::new(crate::config::DEFAULT_MAX_BUILD_OUTPUT_BYTES),
     )
 }
 
@@ -85,10 +137,10 @@ fn run_step_with_log(
     step: &StepConfig,
     workspace: &Path,
     log_path: &Path,
-    log: &BuildLog,
-    step_index: u32,
+    log_context: LogContext<'_>,
     timeout_seconds: Option<u64>,
     cancellation_requested: &AtomicBool,
+    output_budget: OutputBudget,
 ) -> Result<StepOutcome, ExecutorError> {
     let deadline = match timeout_seconds {
         Some(seconds) => Some(
@@ -125,8 +177,20 @@ fn run_step_with_log(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    let stdout_thread = read_stream(stdout, log.clone(), step_index, LogStream::Stdout);
-    let stderr_thread = read_stream(stderr, log.clone(), step_index, LogStream::Stderr);
+    let stdout_thread = read_stream(
+        stdout,
+        log_context.log.clone(),
+        log_context.step_index,
+        LogStream::Stdout,
+        output_budget.clone(),
+    );
+    let stderr_thread = read_stream(
+        stderr,
+        log_context.log.clone(),
+        log_context.step_index,
+        LogStream::Stderr,
+        output_budget.clone(),
+    );
     let process_group = child.id();
 
     loop {
@@ -134,13 +198,29 @@ fn run_step_with_log(
             Ok(Some(status)) => {
                 terminate_process_group(process_group)?;
                 join_streams(stdout_thread, stderr_thread)?;
+                if cancellation_requested.load(Ordering::Acquire) {
+                    return step_outcome(
+                        step,
+                        log_path,
+                        StepStatus::Cancelled,
+                        None,
+                        Some(started_at),
+                    );
+                }
+                if output_budget.exceeded.load(Ordering::Acquire) {
+                    return step_outcome(
+                        step,
+                        log_path,
+                        StepStatus::OutputLimitExceeded,
+                        None,
+                        Some(started_at),
+                    );
+                }
                 let code = status.code().unwrap_or(-1);
                 return step_outcome(
                     step,
                     log_path,
-                    if cancellation_requested.load(Ordering::Acquire) {
-                        StepStatus::Cancelled
-                    } else if status.success() {
+                    if status.success() {
                         StepStatus::Succeeded
                     } else {
                         StepStatus::Failed
@@ -160,6 +240,20 @@ fn run_step_with_log(
                         step,
                         log_path,
                         StepStatus::Cancelled,
+                        None,
+                        Some(started_at),
+                    );
+                }
+                if output_budget.exceeded.load(Ordering::Acquire) {
+                    terminate_process_group(process_group)?;
+                    child
+                        .wait()
+                        .map_err(|err| ExecutorError::SpawnFailed(err.to_string()))?;
+                    join_streams(stdout_thread, stderr_thread)?;
+                    return step_outcome(
+                        step,
+                        log_path,
+                        StepStatus::OutputLimitExceeded,
                         None,
                         Some(started_at),
                     );
@@ -282,7 +376,26 @@ pub fn execute_pipeline_with_cancellation(
     timeout_seconds: Option<u64>,
     cancellation_requested: &AtomicBool,
 ) -> Result<Vec<StepOutcome>, ExecutorError> {
+    execute_pipeline_with_output_limit(
+        workspace,
+        steps,
+        log_path,
+        timeout_seconds,
+        cancellation_requested,
+        crate::config::DEFAULT_MAX_BUILD_OUTPUT_BYTES,
+    )
+}
+
+pub fn execute_pipeline_with_output_limit(
+    workspace: &Path,
+    steps: &[StepConfig],
+    log_path: &Path,
+    timeout_seconds: Option<u64>,
+    cancellation_requested: &AtomicBool,
+    max_output_bytes: u64,
+) -> Result<Vec<StepOutcome>, ExecutorError> {
     let log = BuildLog::open_append(log_path).map_err(ExecutorError::LogWriteFailed)?;
+    let output_budget = OutputBudget::new(max_output_bytes);
     let mut results = Vec::with_capacity(steps.len());
     let build_deadline = match timeout_seconds {
         Some(seconds) => Some(
@@ -329,10 +442,13 @@ pub fn execute_pipeline_with_cancellation(
                 step,
                 workspace,
                 log_path,
-                &log,
-                step_index,
+                LogContext {
+                    log: &log,
+                    step_index,
+                },
                 timeout,
                 cancellation_requested,
+                output_budget.clone(),
             )?
         };
         let status = match outcome.status {
@@ -340,6 +456,7 @@ pub fn execute_pipeline_with_cancellation(
             StepStatus::Failed => "failed",
             StepStatus::TimedOut => "timed_out",
             StepStatus::Cancelled => "cancelled",
+            StepStatus::OutputLimitExceeded => "output_limit_exceeded",
         };
         log.append(
             Some(step_index),
@@ -351,7 +468,10 @@ pub fn execute_pipeline_with_cancellation(
         results.push(outcome);
         if matches!(
             results.last().unwrap().status,
-            StepStatus::Failed | StepStatus::TimedOut | StepStatus::Cancelled
+            StepStatus::Failed
+                | StepStatus::TimedOut
+                | StepStatus::Cancelled
+                | StepStatus::OutputLimitExceeded
         ) {
             break;
         }
@@ -490,10 +610,13 @@ mod tests {
             &step,
             dir.path(),
             &log_path,
-            &log,
-            0,
+            LogContext {
+                log: &log,
+                step_index: 0,
+            },
             Some(5),
             &cancellation,
+            OutputBudget::new(crate::config::DEFAULT_MAX_BUILD_OUTPUT_BYTES),
         )
         .unwrap();
         signal_thread.join().unwrap();
@@ -502,6 +625,53 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(800));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn output_limit_caps_combined_streams_and_terminates_the_process_group() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("limited.log");
+        let steps = [
+            StepConfig {
+                name: "first-output".to_string(),
+                run: "head -c 2048 /dev/zero".to_string(),
+                working_directory: None,
+                timeout_minutes: None,
+                env: Default::default(),
+            },
+            StepConfig {
+                name: "concurrent-output".to_string(),
+                run: "(head -c 100000 /dev/zero) & (head -c 100000 /dev/zero >&2) & wait"
+                    .to_string(),
+                working_directory: None,
+                timeout_minutes: None,
+                env: Default::default(),
+            },
+        ];
+        let result = execute_pipeline_with_output_limit(
+            dir.path(),
+            &steps,
+            &log_path,
+            Some(5),
+            &AtomicBool::new(false),
+            4096,
+        );
+
+        let outcomes = result.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].status, StepStatus::Succeeded);
+        assert_eq!(outcomes[1].status, StepStatus::OutputLimitExceeded);
+        let page = crate::logs::read_page(&log_path, None, 100, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.records
+                .iter()
+                .filter(|record| matches!(record.stream, "stdout" | "stderr"))
+                .map(|record| record.payload.len())
+                .sum::<usize>(),
+            4096
+        );
     }
 
     #[test]
